@@ -52,6 +52,13 @@ test: cfs.o
 	cc $(CFLAGS) test/cfs_part_test.c cfs.o cfs_part.o cfs_mkfs_ext4.c cfs_mkfs_fat32.o ../libcpool/cpenc.o -lm -o test/cfs_part_test
 	./test/cfs_part_test
 
+# Deep stress tests (random writes, block-cap fallback, part loops).
+# NOTE: known flaky under PRoot/Termux (stack-layout-sensitive corruption,
+# see PLAN.md) — run on real hardware (GCP) where ASAN is available.
+stress: cfs.o cfs_part.o
+	cc $(CFLAGS) test/cfs_stress_test.c cfs.o cfs_part.o ../libcpool/cpenc.o -lm -o test/cfs_stress_test
+	./test/cfs_stress_test
+
 testall: test cfs-tool cfs_preload.so cfs_block_hook.so
 	@echo "=== cfs-tool smoke test ==="
 	./cfs-tool 2>&1 | head -1
@@ -63,4 +70,4 @@ testall: test cfs-tool cfs_preload.so cfs_block_hook.so
 
 clean:
 	rm -f cfs.o cfs_part.o cfs_mkfs_fat32.o cfs_preload.o cfs_preload.so cfs-tool cfs_block_hook.so
-	rm -f test/cfs_test test/cfs_rw_test test/cfs_dir_test test/cfs_new_test test/cfs_compact_test test/cfs_block_test test/cfs_part_test test/vblk_probe
+	rm -f test/cfs_test test/cfs_rw_test test/cfs_dir_test test/cfs_new_test test/cfs_compact_test test/cfs_block_test test/cfs_part_test test/cfs_stress_test test/vblk_probe
