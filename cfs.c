@@ -21,6 +21,8 @@ static InodeEntry *lu(CFS *c,const char *path){for(uint32_t i=0;i<c->inode_count
 
 /* ── Write superblock + inode table to disk ────────────────────── */
 static int cfs_sync(CFS *c) {
+    volatile uint64_t canary_a = 0xCAFEBABECAFEBABEULL;
+    volatile uint64_t canary_b = 0xDEADBEEFDEADBEEFULL;
     if (!c || !(c->flags & CFS_RDWR)) return -1;
 
     /* Serialise inode table */
@@ -88,6 +90,8 @@ static int cfs_sync(CFS *c) {
     wr64(sb + 26, c->sb.created_at);
     if (pwrite(c->fd, sb, CFS_SB_SIZE, 0) != CFS_SB_SIZE) return -1;
     if (fsync(c->fd) != 0) return -1;
+    if (canary_a != 0xCAFEBABECAFEBABEULL || canary_b != 0xDEADBEEFDEADBEEFULL)
+        write(2, "CANARY CORRUPT in cfs_sync\n", 27);
     return 0;
 }
 
@@ -1160,7 +1164,7 @@ int cfs_block_write(CFS *c, const void *buf, size_t size, off_t offset) {
                 CfsBlock *blk = &e->raw.blocks[nb + hi];
                 memset(blk, 0, sizeof(*blk));
                 blk->offset = app; blk->comp_size = (uint32_t)pend_cl[i];
-                blk->orig_size = (uint32_t)pend_orig[hi];
+                blk->orig_size = (uint32_t)pend_orig[i];   /* written at pend slot i, not hi */
                 app += pend_cl[i];
                 hi++;
             } else {
@@ -1171,11 +1175,6 @@ int cfs_block_write(CFS *c, const void *buf, size_t size, off_t offset) {
         }
         nb += (uint32_t)hi;
         e->raw.block_count = nb;
-        for (uint32_t b = 0; b < nb; b++)
-            fprintf(stderr, " [%u]@%llu cs=%u os=%u",
-                    b, (unsigned long long)e->raw.blocks[b].offset,
-                    e->raw.blocks[b].comp_size, e->raw.blocks[b].orig_size);
-        fprintf(stderr, "\n");
     }
 
     uint64_t want = prev_sz > minsz ? prev_sz : minsz;
