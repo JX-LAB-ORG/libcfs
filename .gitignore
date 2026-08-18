@@ -10,3 +10,5 @@ test/cfs_compact_test
 test/cfs_block_test
 test/cfs_part_test
 test/vblk_probe
+cpenc.c
+cpenc.h
