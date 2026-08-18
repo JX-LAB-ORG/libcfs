@@ -1,0 +1,12 @@
+*.o
+*.so
+cfs-tool
+cfs-fuse
+test/cfs_test
+test/cfs_rw_test
+test/cfs_dir_test
+test/cfs_new_test
+test/cfs_compact_test
+test/cfs_block_test
+test/cfs_part_test
+test/vblk_probe
