@@ -16,8 +16,8 @@ cfs_mkfs_fat32.o: cfs_mkfs_fat32.c cfs.h
 cfs_preload.so: cfs_preload.c cfs.o ../libcpool/cpenc.o
 	cc $(CFLAGS) -fPIC cfs_preload.c cfs.o ../libcpool/cpenc.o -shared -ldl -lm -o cfs_preload.so
 
-cfs-tool: cfs-tool.c cfs.o cfs_part.o cfs_mkfs_fat32.o cfs_mkfs_ext4.c ../libcpool/cpenc.o
-	cc $(CFLAGS) cfs-tool.c cfs.o cfs_part.o cfs_mkfs_fat32.o cfs_mkfs_ext4.c ../libcpool/cpenc.o -lm -o cfs-tool
+cfs-tool: cfs-tool.c cfs.o cfs_part.o cfs_mkfs_fat32.o cfs_mkfs_ext4.c cfs_mkfs_swap.c ../libcpool/cpenc.o
+	cc $(CFLAGS) cfs-tool.c cfs.o cfs_part.o cfs_mkfs_fat32.o cfs_mkfs_ext4.c cfs_mkfs_swap.c ../libcpool/cpenc.o -lm -o cfs-tool
 
 cfs_block_hook.so: cfs_block_hook.c cfs.o cfs_part.o ../libcpool/cpenc.o
 	cc $(CFLAGS) -fPIC cfs_block_hook.c cfs.o cfs_part.o ../libcpool/cpenc.o -shared -ldl -lm -o cfs_block_hook.so

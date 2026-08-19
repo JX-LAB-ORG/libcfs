@@ -90,6 +90,8 @@ int     cfs_mkfs_ext4(CFS *cfs, uint64_t disk_sz);
 int     cfs_mkfs_ext4_at(CFS *cfs, uint64_t base_off, uint64_t size);
 int     cfs_mkfs_fat32(CFS *cfs, uint64_t disk_sz);
 int     cfs_mkfs_fat32_at(CFS *cfs, uint64_t base_off, uint64_t size);
+int     cfs_mkfs_swap(CFS *cfs, uint64_t disk_sz);
+int     cfs_mkfs_swap_at(CFS *cfs, uint64_t base_off, uint64_t size);
 
 /* ─── Stats ────────────────────────────────────────────────── */
 typedef struct {

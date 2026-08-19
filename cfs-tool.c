@@ -17,7 +17,7 @@ static void usage(const char *prog) {
         "  unpack <cfs>        <path> <out> Extract one file from .cfs\n"
         "  write  <cfs>        <path> <src> Write local file into .cfs\n"
         "  mkfs   <type> <size> <cfs> [-p <n>] [-g]\n"
-        "                                  Format .cfs as ext4/fat32\n"
+        "                                  Format .cfs as ext4/fat32/swap\n"
         "                                  -p <n>: format inside partition n\n"
         "                                  -g:     GPT partition table (with -p)\n"
         "  ls     <cfs>        [dir]        List contents\n"
@@ -356,7 +356,7 @@ int main(int argc, char *argv[]) {
          * Self-contained: writes fs structures directly, no external tools. */
         if (argc < 4) {
             fprintf(stderr, "Usage: %s mkfs <fstype> <size> <out.cfs> [-p <n>] [-g]\n", argv[0]);
-            fprintf(stderr, "  fstype: ext4 | fat32\n");
+            fprintf(stderr, "  fstype: ext4 | fat32 | swap\n");
             fprintf(stderr, "  size:   100M, 1G, 10G, etc.\n");
             fprintf(stderr, "  -p <n>: format inside partition n (creates MBR + partition 1)\n");
             fprintf(stderr, "  -g:     use GPT instead of MBR (with -p)\n");
@@ -371,8 +371,9 @@ int main(int argc, char *argv[]) {
 
         int is_ext4 = !strcmp(fstype, "ext4");
         int is_fat32 = !strcmp(fstype, "fat32");
-        if (!is_ext4 && !is_fat32) {
-            fprintf(stderr, "mkfs: only ext4/fat32 are supported\n");
+        int is_swap = !strcmp(fstype, "swap");
+        if (!is_ext4 && !is_fat32 && !is_swap) {
+            fprintf(stderr, "mkfs: only ext4/fat32/swap are supported\n");
             return 1;
         }
 
@@ -409,11 +410,13 @@ int main(int argc, char *argv[]) {
             if (cfs_part_get(c, 1, &p) != 0) {
                 fprintf(stderr, "mkfs: partition lookup failed\n"); cfs_close(c); unlink(out); return 1;
             }
-            rc = is_ext4 ? cfs_mkfs_ext4_at(c, p.start, p.size)
-                         : cfs_mkfs_fat32_at(c, p.start, p.size);
+            if (is_ext4) rc = cfs_mkfs_ext4_at(c, p.start, p.size);
+            else if (is_fat32) rc = cfs_mkfs_fat32_at(c, p.start, p.size);
+            else rc = cfs_mkfs_swap_at(c, p.start, p.size);
         } else {
-            rc = is_ext4 ? cfs_mkfs_ext4(c, disk_sz)
-                         : cfs_mkfs_fat32(c, disk_sz);
+            if (is_ext4) rc = cfs_mkfs_ext4(c, disk_sz);
+            else if (is_fat32) rc = cfs_mkfs_fat32(c, disk_sz);
+            else rc = cfs_mkfs_swap(c, disk_sz);
         }
         cfs_finalise(c);
         cfs_close(c);
@@ -423,7 +426,8 @@ int main(int argc, char *argv[]) {
         printf("cfs: %llu MB %s filesystem written to %s\n",
                (unsigned long long)(disk_sz >> 20), fstype, out);
         if (!part)
-            printf("     mount with: cfs_block_hook.so + mount -t %s /dev/vda /mnt\n", is_ext4 ? "ext4" : "vfat");
+            printf("     mount with: cfs_block_hook.so + mount -t %s /dev/vda /mnt\n",
+                   is_ext4 ? "ext4" : (is_fat32 ? "vfat" : "swap"));
         else
             printf("     partition table: %s, fs on partition 1\n", gpt ? "gpt" : "mbr");
         return 0;
