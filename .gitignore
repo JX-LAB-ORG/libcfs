@@ -12,3 +12,4 @@ test/cfs_part_test
 test/vblk_probe
 cpenc.c
 cpenc.h
+test/cfs_stress_test

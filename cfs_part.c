@@ -188,10 +188,6 @@ static int gpt_parse(const uint8_t *table, size_t table_len,
 static void gpt_build(uint8_t *lba0, uint8_t *hdr, uint8_t *entries,
                       const CfsPartition *parts, int n,
                       uint64_t disk_sectors) {
-    for (int i = 0; i < n && i < 5; i++)
-        fprintf(stderr, " p%d{idx=%d guid='%s' ts='%s'}",
-                i, parts[i].index, parts[i].guid, parts[i].type_str);
-    fprintf(stderr, "\n");
     /* Protective MBR @LBA0 (type 0xEE, NOT the 0xEF ESP type) */
     mbr_build(lba0, NULL, 0);
     MbrEntry *pe = (MbrEntry *)(lba0 + MBR_PART_OFF);
@@ -259,16 +255,6 @@ static void gpt_build(uint8_t *lba0, uint8_t *hdr, uint8_t *entries,
 /* ── Cache loading ─────────────────────────────────────────────── */
 static int part_load(CFS *c) {
     if (c->part_kind != -1) return 0;
-    for (uint32_t i = 0; i < c->inode_count; i++) {
-        if (c->inodes[i].path && !strcmp(c->inodes[i].path, "@block")) {
-            for (uint32_t b = 0; b < c->inodes[i].raw.block_count; b++)
-                fprintf(stderr, " [%u]off=%llu cs=%u os=%u",
-                        b, (unsigned long long)c->inodes[i].raw.blocks[b].offset,
-                        c->inodes[i].raw.blocks[b].comp_size,
-                        c->inodes[i].raw.blocks[b].orig_size);
-            fprintf(stderr, "\n");
-        }
-    }
 
     c->part_kind = CFS_PART_NONE;
     c->part_n = 0;
