@@ -14,6 +14,7 @@
 #include <sys/ioctl.h>
 #include <sys/sysmacros.h>
 #include <linux/fs.h>
+#include <linux/hdreg.h>
 #include <limits.h>
 #include <stdarg.h>
 #include <sys/mman.h>
@@ -261,6 +262,9 @@ int ioctl(int fd, int req, ...) {
     case BLKSSZGET: *(int*)a = blk_ssz; return 0;
     case BLKBSZGET: *(int*)a = 4096; return 0;
     case BLKGETSIZE: *(unsigned long*)a = (unsigned long)(sz / (uint64_t)blk_ssz); return 0;
+    case BLKIOMIN: *(unsigned int*)a = blk_ssz; return 0;
+    case BLKIOOPT: *(unsigned int*)a = 4096; return 0;
+    case BLKALIGNOFF: *(int*)a = 0; return 0;
     case 0x125E: /*BLKROGET*/ *(int*)a = 0; return 0;
     case 0x125F: /*BLKRRPART — truly re-read the disk: the inode table may
                     have moved (external writers append new blocks), so
@@ -276,7 +280,47 @@ int ioctl(int fd, int req, ...) {
             return 0;
         }
     case 0x1261: /*BLKFLSBUF*/ return 0;
-    case 0x1277: /*BLKDISCARD*/ return 0;
+    case 0x1277: /*BLKDISCARD — arg is uint64_t range[2] (start, len) bytes;
+                    discarded data must read back as zeros */
+        {
+            uint64_t rng[2];
+            memcpy(rng, a, sizeof(rng));
+            if (bf->part) {
+                if (rng[0] + rng[1] > bf->psize) { errno = EINVAL; return -1; }
+                rng[0] += bf->pstart;
+            }
+            if (rng[0] + rng[1] > cfs_block_size(blk_cfs)) { errno = EINVAL; return -1; }
+            static uint8_t zbuf[4096];
+            uint64_t off = rng[0], left = rng[1];
+            while (left > 0) {
+                size_t n = left > sizeof(zbuf) ? sizeof(zbuf) : (size_t)left;
+                if (cfs_block_write(blk_cfs, zbuf, n, (off_t)off) != 0) { errno = EIO; return -1; }
+                off += n; left -= n;
+            }
+            return 0;
+        }
+    case HDIO_GETGEO: {
+        struct hd_geometry *g = a;
+        uint64_t sectors = sz / 512;
+        g->heads = 255;
+        g->sectors = 63;
+        g->cylinders = (unsigned short)(sectors / (255ULL * 63ULL));
+        g->start = (unsigned long)(bf->part ? bf->pstart / 512 : 0);
+        return 0;
+    }
+    case HDIO_GET_IDENTITY: {
+        /* ATA identify block: serial @20, firmware @46, model @54,
+         * all space-padded to fixed widths */
+        unsigned char *id = a;
+        memset(id, 0, 512);
+        memset(id + 20, ' ', 20);
+        memcpy(id + 20, "CFS0001", 7);
+        memset(id + 46, ' ', 8);
+        memcpy(id + 46, "v3.1", 4);
+        memset(id + 54, ' ', 40);
+        memcpy(id + 54, "CFS VIRTUAL DISK", sizeof("CFS VIRTUAL DISK") - 1);
+        return 0;
+    }
     default: _DBG("  UNKNOWN IOCTL"); errno = ENOTTY; return -1;
     }
 }

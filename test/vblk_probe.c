@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <linux/fs.h>
+#include <linux/hdreg.h>
 
 int main(int argc, char **argv) {
     if (argc < 3) return 2;
@@ -54,6 +55,41 @@ int main(int argc, char **argv) {
         if (n != (ssize_t)len) { printf("read-fail:%zd\n", n); return 0; }
         for (size_t i = 0; i < len; i++) printf("%02x", b[i]);
         printf("\n");
+        return 0;
+    }
+    if (!strcmp(cmd, "geo") || !strcmp(cmd, "ident") || !strcmp(cmd, "iomin") ||
+        !strcmp(cmd, "ioopt") || !strcmp(cmd, "alignoff") || !strcmp(cmd, "discard")) {
+        int fd = open(dev, O_RDWR);
+        if (fd < 0) { printf("open-fail\n"); return 0; }
+        if (!strcmp(cmd, "geo")) {
+            struct hd_geometry g;
+            if (ioctl(fd, HDIO_GETGEO, &g)) { printf("ioctl-fail\n"); return 0; }
+            printf("%u:%u:%u:%lu\n", g.heads, g.sectors, g.cylinders, g.start);
+        } else if (!strcmp(cmd, "ident")) {
+            unsigned char id[512];
+            if (ioctl(fd, HDIO_GET_IDENTITY, id)) { printf("ioctl-fail\n"); return 0; }
+            char model[41]; memcpy(model, id + 54, 40); model[40] = 0;
+            char *e = model + 39; while (e >= model && *e == ' ') *e-- = 0;
+            printf("%s\n", model);
+        } else if (!strcmp(cmd, "iomin")) {
+            unsigned int v;
+            if (ioctl(fd, BLKIOMIN, &v)) { printf("ioctl-fail\n"); return 0; }
+            printf("%u\n", v);
+        } else if (!strcmp(cmd, "ioopt")) {
+            unsigned int v;
+            if (ioctl(fd, BLKIOOPT, &v)) { printf("ioctl-fail\n"); return 0; }
+            printf("%u\n", v);
+        } else if (!strcmp(cmd, "alignoff")) {
+            int v;
+            if (ioctl(fd, BLKALIGNOFF, &v)) { printf("ioctl-fail\n"); return 0; }
+            printf("%d\n", v);
+        } else {
+            unsigned long off = strtoul(argv[3], 0, 0);
+            unsigned long len = strtoul(argv[4], 0, 0);
+            uint64_t rng[2] = { off, len };
+            if (ioctl(fd, BLKDISCARD, rng)) { printf("ioctl-fail\n"); return 0; }
+            printf("ok\n");
+        }
         return 0;
     }
     if (!strcmp(cmd, "stalecheck") && argc >= 5) {

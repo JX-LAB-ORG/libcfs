@@ -45,6 +45,27 @@ ck "$(CFS_SECTOR_SIZE=4096 ./test/vblk_probe /dev/vda getsize)" "16384" "BLKGETS
 echo "[h4] aliases off by default"
 ck "$(env -u CFS_BLOCK_PARTS ./test/vblk_probe /dev/vda1 size64)" "open-fail" "no alias without CFS_BLOCK_PARTS"
 
+echo "[h5] disk metadata ioctls"
+GEO=$(./test/vblk_probe /dev/vda geo)
+ck "$(echo "$GEO" | cut -d: -f1-3)" "255:63:8" "HDIO_GETGEO heads/sectors/cylinders (64MB)"
+ck "$(echo "$GEO" | cut -d: -f4)" "0" "whole disk geo start"
+GEO1=$(./test/vblk_probe /dev/vda1 geo)
+ck "$(echo "$GEO1" | cut -d: -f4)" "2048" "partition geo start = 2048"
+ck "$(./test/vblk_probe /dev/vda ident)" "CFS VIRTUAL DISK" "HDIO_GET_IDENTITY model"
+ck "$(./test/vblk_probe /dev/vda iomin)" "512" "BLKIOMIN"
+ck "$(./test/vblk_probe /dev/vda ioopt)" "4096" "BLKIOOPT"
+ck "$(./test/vblk_probe /dev/vda alignoff)" "0" "BLKALIGNOFF"
+
+echo "[h6] BLKDISCARD zeroes the range"
+BEFORE=$(./test/vblk_probe /dev/vda1 read 32768 8)
+ck "$BEFORE" "0000000000000000" "region empty before (ext4 meta sits at 1MB+)"
+./test/vblk_probe /dev/vda1 discard 65536 4096 >/dev/null
+AFTER=$(./test/vblk_probe /dev/vda1 read 65536 8)
+ck "$AFTER" "0000000000000000" "discarded range reads zero"
+# discard must also work on the whole disk (cross-partition range)
+./test/vblk_probe /dev/vda discard 1048576 4096 >/dev/null
+ck "$(./test/vblk_probe /dev/vda read 1048576 4)" "00000000" "whole-disk discard zeroes"
+
 unset LD_PRELOAD
 echo ""
 echo "=== hook test: $PASS ok, $FAIL failed ==="
