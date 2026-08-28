@@ -88,6 +88,8 @@ void    cfs_part_invalidate(CFS *cfs);
 /* ─── Self-contained mkfs ──────────────────────────────────── */
 int     cfs_mkfs_ext4(CFS *cfs, uint64_t disk_sz);
 int     cfs_mkfs_ext4_at(CFS *cfs, uint64_t base_off, uint64_t size);
+int     cfs_mkfs_ext4_install(CFS *cfs, uint64_t base_off, uint64_t size,
+                              const uint8_t *iso_img, size_t iso_sz);
 int     cfs_mkfs_fat32(CFS *cfs, uint64_t disk_sz);
 int     cfs_mkfs_fat32_at(CFS *cfs, uint64_t base_off, uint64_t size);
 int     cfs_mkfs_swap(CFS *cfs, uint64_t disk_sz);
@@ -124,6 +126,11 @@ int    cfs_pack(CFS *cfs, const char *cfs_path, const char *local_path);
 
 /* ─── Batch creation (build container from scratch) ──────────── */
 CFS   *cfs_create(const char *path);
+/* Mark a container as RAW (uncompressed) and persist it in the
+ * superblock.  Must be called on a fresh container before writing data;
+ * afterwards every open() of the file enters uncompressed mode
+ * automatically. */
+int    cfs_set_raw(CFS *c);
 int    cfs_add_file(CFS *cfs, const char *vpath,
                     const void *buf, size_t size);
 int    cfs_finalise(CFS *cfs);

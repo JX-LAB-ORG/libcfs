@@ -43,22 +43,25 @@ int cfs_mkfs_ext4_at(CFS *c, uint64_t base_off, uint64_t size) {
     Ext4Super sb; memset(&sb, 0, sizeof(sb));
     sb.s_inodes_count      = ic;
     sb.s_blocks_count_lo   = bc;
-    sb.s_free_blocks_count_lo = bc > oh ? bc - oh : 0;
-    sb.s_free_inodes_count = ic - 2 + 1;
+    sb.s_free_blocks_count_lo = bc > oh ? bc - oh - 1 : 0;
+    sb.s_free_inodes_count = ic - 2;
     sb.s_first_data_block  = 0;
     sb.s_log_block_size    = 2; /* 4KB */
     sb.s_log_cluster_size  = 2;
     sb.s_blocks_per_group  = bc;
     sb.s_inodes_per_group  = ic;
     sb.s_magic       = 0xEF53;
-    sb.s_state       = 0;
+    sb.s_state       = 1;   /* EXT4_VALID_FS — no journal, clean state */
     sb.s_errors      = 1;
     sb.s_creator_os  = 0;
     sb.s_rev_level   = 1;
     sb.s_first_ino   = 2; /* EXT4_ROOT_INO */
     sb.s_inode_size  = 256;
     sb.s_block_group_nr = 0;
-    sb.s_feature_compat   = 0x0004 | 0x0008;
+    /* compat = EXT_ATTR only. HAS_JOURNAL was set but no journal inode
+     * exists — kernels reject such a mount. No-journal (ext2-style)
+     * filesystem is fully mountable by ext4. */
+    sb.s_feature_compat   = 0x0008;
     sb.s_feature_incompat = 0x0002 | 0x0040;
     sb.s_feature_ro_compat= 0x0003 | 0x0008 | 0x0040 | 0x0080 | 0x0100;
     uuid_gen(sb.s_uuid);
@@ -73,8 +76,8 @@ int cfs_mkfs_ext4_at(CFS *c, uint64_t base_off, uint64_t size) {
     bgd.bg_block_bitmap_lo = 1;
     bgd.bg_inode_bitmap_lo = 2;
     bgd.bg_inode_table_lo  = 3;
-    bgd.bg_free_blocks_count_lo = (uint16_t)(bc > oh ? bc - oh : 0);
-    bgd.bg_free_inodes_count_lo = (uint16_t)(ic - 2 + 1);
+    bgd.bg_free_blocks_count_lo = (uint16_t)(bc > oh ? bc - oh - 1 : 0);
+    bgd.bg_free_inodes_count_lo = (uint16_t)(ic - 2);
     bgd.bg_used_dirs_count = 1;
     memcpy(img + 2048, &bgd, sizeof(bgd));
 
@@ -82,8 +85,8 @@ int cfs_mkfs_ext4_at(CFS *c, uint64_t base_off, uint64_t size) {
     for (uint32_t i = 0; i <= db; i++)
         img[1 * bs + i / 8] |= (uint8_t)(1 << (i % 8));
 
-    /* Inode bitmap at block 2 */
-    img[2 * bs + 0] = 0x04; /* inode 2 (root) used */
+    /* Inode bitmap at block 2: inode 1 (bad blocks) and 2 (root) used */
+    img[2 * bs + 0] = 0x06;
 
     /* Root inode (inode 2 = index 1) at block 3 */
     Ext4Inode ri; memset(&ri, 0, sizeof(ri));
@@ -96,9 +99,14 @@ int cfs_mkfs_ext4_at(CFS *c, uint64_t base_off, uint64_t size) {
     ri.i_atime = (uint32_t)now; ri.i_ctime = (uint32_t)now;
     ri.i_mtime = (uint32_t)now; ri.i_crtime = (uint32_t)now;
     ri.i_blocks_lo = (bs + 511) / 512;
-    ri.i_block[0] = 0xF30A; /* extent header */
-    ri.i_block[1] = 1; ri.i_block[2] = 6;
-    ri.i_block[3] = 0; ri.i_block[4] = 1; ri.i_block[5] = db;
+    /* Extent header: magic | entries=1, max=4, depth=0, gen=0 */
+    ri.i_block[0] = 0xF30A | (1u << 16);
+    ri.i_block[1] = 4;
+    ri.i_block[2] = 0;
+    /* Extent entry: ee_block=0, ee_len=1, ee_start_hi=0, ee_start_lo=db */
+    ri.i_block[3] = 0;
+    ri.i_block[4] = 1;
+    ri.i_block[5] = db;
     memcpy(img + 3 * bs + 1 * 256, &ri, sizeof(ri));
 
     /* Root directory at data_block */

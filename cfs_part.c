@@ -412,7 +412,7 @@ int cfs_part_add(CFS *c, uint64_t start, uint64_t size,
         uint64_t a0 = c->part_cache[i].start, a1 = a0 + c->part_cache[i].size;
         if (start < a1 && a0 < start + size) return -6;   /* overlap */
     }
-    if (start % (1ULL << 20) != 0)
+    if (start * MBR_SECTOR_SIZE % (1ULL << 20) != 0)
         fprintf(stderr, "cfs: warning: partition start not 1MB-aligned (%llu)\n",
                 (unsigned long long)start);
 

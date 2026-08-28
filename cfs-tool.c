@@ -13,10 +13,13 @@ static void usage(const char *prog) {
         "\n"
         "Commands:\n"
         "  mount  <cfs>        [mount_pt]   Mount .cfs and spawn shell\n"
-        "  pack   <dir>        <out.cfs>    Pack directory into .cfs\n"
+        "  pack   <dir>        <out.cfs>    Pack directory into .cfs [--raw]\n"
         "  unpack <cfs>        <path> <out> Extract one file from .cfs\n"
         "  write  <cfs>        <path> <src> Write local file into .cfs\n"
         "  mkfs   <type> <size> <cfs> [-p <n>] [-g]\n"
+        "  install <iso> <size> <cfs> [-p <n>] [-g]\n"
+        "                                  Install ISO content into ext4\n"
+        "                                  (mkfs + populate, standalone disk)\n"
         "                                  Format .cfs as ext4/fat32/swap\n"
         "                                  -p <n>: format inside partition n\n"
         "                                  -g:     GPT partition table (with -p)\n"
@@ -142,10 +145,13 @@ int main(int argc, char *argv[]) {
     if (!strcmp(cmd, "pack")) {
         if (argc < 4) { usage(argv[0]); return 1; }
         const char *dir = argv[2], *out = argv[3];
+        int raw = 0;
+        for (int i = 4; i < argc; i++) if (!strcmp(argv[i], "--raw")) raw = 1;
 
         unlink(out);
         CFS *c = cfs_create(out);
         if (!c) { fprintf(stderr, "cfs_create(%s) failed\n", out); return 1; }
+        if (raw && cfs_set_raw(c) != 0) { fprintf(stderr, "pack: set raw failed\n"); cfs_close(c); unlink(out); return 1; }
 
         int n = pack_dir(c, dir, "");
         if (n < 0) { cfs_close(c); unlink(out); return 1; }
@@ -363,10 +369,11 @@ int main(int argc, char *argv[]) {
             return 1;
         }
         const char *fstype = argv[2], *size_str = argv[3], *out = argv[4];
-        int part = 0, gpt = 0;
+        int part = 0, gpt = 0, raw = 0;
         for (int i = 5; i < argc; i++) {
             if (!strcmp(argv[i], "-p") && i + 1 < argc) part = atoi(argv[++i]);
             else if (!strcmp(argv[i], "-g")) gpt = 1;
+            else if (!strcmp(argv[i], "--raw")) raw = 1;
         }
 
         int is_ext4 = !strcmp(fstype, "ext4");
@@ -393,6 +400,7 @@ int main(int argc, char *argv[]) {
         unlink(out);
         CFS *c = cfs_create(out);
         if (!c) { perror(out); return 1; }
+        if (raw && cfs_set_raw(c) != 0) { fprintf(stderr, "mkfs: set raw failed\n"); cfs_close(c); unlink(out); return 1; }
 
         int rc;
         cfs_block_resize(c, disk_sz);
@@ -430,6 +438,87 @@ int main(int argc, char *argv[]) {
                    is_ext4 ? "ext4" : (is_fat32 ? "vfat" : "swap"));
         else
             printf("     partition table: %s, fs on partition 1\n", gpt ? "gpt" : "mbr");
+        return 0;
+    }
+
+    if (!strcmp(cmd, "install")) {
+        /* cfs-tool install <iso> <size> <out.cfs> [-p <n>] [-g]
+         * Build a standalone disk: mkfs ext4 + populate from the ISO.
+         * Without -p the filesystem goes on the bare @block; with -p on
+         * partition n (MBR by default, -g for GPT). */
+        if (argc < 5) {
+            fprintf(stderr, "Usage: %s install <iso> <size> <out.cfs> [-p <n>] [-g]\n", argv[0]);
+            fprintf(stderr, "  size:  100M, 1G, etc. (disk size; ISO must fit)\n");
+            fprintf(stderr, "  -p <n>: install into partition n (creates MBR + partition 1 if missing)\n");
+            fprintf(stderr, "  -g:     use GPT instead of MBR (with -p)\n");
+            return 1;
+        }
+        const char *iso_path = argv[2], *size_str = argv[3], *out = argv[4];
+        int part = 0, gpt = 0, raw = 0;
+        for (int i = 5; i < argc; i++) {
+            if (!strcmp(argv[i], "-p") && i + 1 < argc) part = atoi(argv[++i]);
+            else if (!strcmp(argv[i], "-g")) gpt = 1;
+            else if (!strcmp(argv[i], "--raw")) raw = 1;
+        }
+
+        uint64_t disk_sz = 0;
+        {   char *end; double v = strtod(size_str, &end);
+            if (*end == 'G' || *end == 'g') disk_sz = (uint64_t)(v * 1073741824.0);
+            else if (*end == 'M' || *end == 'm') disk_sz = (uint64_t)(v * 1048576.0);
+            else if (*end == 'K' || *end == 'k') disk_sz = (uint64_t)(v * 1024.0);
+            else if (*end == 0) disk_sz = (uint64_t)v;
+        }
+        if (disk_sz < 2ULL * 1024 * 1024) { fprintf(stderr, "install: size too small (min 2MB)\n"); return 1; }
+
+        /* read ISO into memory */
+        FILE *f = fopen(iso_path, "rb");
+        if (!f) { perror(iso_path); return 1; }
+        fseek(f, 0, SEEK_END);
+        long isz = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        if (isz < 17 * 2048) { fprintf(stderr, "install: %s too small to be an ISO\n", iso_path); fclose(f); return 1; }
+        uint8_t *iso = malloc((size_t)isz);
+        if (!iso) { fclose(f); return 1; }
+        if (fread(iso, 1, (size_t)isz, f) != (size_t)isz) { fprintf(stderr, "install: read %s failed\n", iso_path); free(iso); fclose(f); return 1; }
+        fclose(f);
+
+        unlink(out);
+        CFS *c = cfs_create(out);
+        if (!c) { perror(out); free(iso); return 1; }
+        if (raw && cfs_set_raw(c) != 0) { fprintf(stderr, "install: set raw failed\n"); cfs_close(c); unlink(out); free(iso); return 1; }
+        cfs_block_resize(c, disk_sz);
+
+        int rc;
+        uint64_t base = 0, fsize = disk_sz;
+        if (part) {
+            int kind = gpt ? CFS_PART_GPT : CFS_PART_MBR;
+            if (cfs_part_label(c, kind) != 0) {
+                fprintf(stderr, "install: partition label failed\n"); cfs_close(c); unlink(out); free(iso); return 1;
+            }
+            uint64_t pstart = 1ULL << 20;   /* LBA 2048 */
+            int ar = cfs_part_add(c, pstart, disk_sz - pstart, 0x83, NULL, 0);
+            if (ar < 0) {
+                fprintf(stderr, "install: partadd failed (%d)\n", ar); cfs_close(c); unlink(out); free(iso); return 1;
+            }
+            CfsPartition p;
+            if (cfs_part_get(c, 1, &p) != 0) {
+                fprintf(stderr, "install: partition lookup failed\n"); cfs_close(c); unlink(out); free(iso); return 1;
+            }
+            base = p.start; fsize = p.size;
+        }
+        if ((uint64_t)isz > fsize) {
+            fprintf(stderr, "install: ISO (%zu B) does not fit filesystem (%llu B)\n", isz, (unsigned long long)fsize);
+            cfs_close(c); unlink(out); free(iso); return 1;
+        }
+
+        rc = cfs_mkfs_ext4_install(c, base, fsize, iso, (size_t)isz);
+        cfs_finalise(c);
+        cfs_close(c);
+        free(iso);
+        if (rc != 0) { fprintf(stderr, "install: failed (%d)\n", rc); unlink(out); return 1; }
+
+        printf("cfs: ISO %s installed on %s (%llu MB disk%s)\n", iso_path, out,
+               (unsigned long long)(disk_sz >> 20), part ? ", partition 1" : "");
         return 0;
     }
 

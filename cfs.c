@@ -88,6 +88,7 @@ static int cfs_sync(CFS *c) {
     wr32(sb + 18, c->sb.inode_size);
     wr32(sb + 22, c->sb.file_count);
     wr64(sb + 26, c->sb.created_at);
+    wr16(sb + 34, c->sb.flags);
     if (pwrite(c->fd, sb, CFS_SB_SIZE, 0) != CFS_SB_SIZE) return -1;
     if (fsync(c->fd) != 0) return -1;
     if (canary_a != 0xCAFEBABECAFEBABEULL || canary_b != 0xDEADBEEFDEADBEEFULL)
@@ -101,6 +102,7 @@ CFS *cfs_create(const char *path) {
     c->fd = open(path, O_RDWR|O_CREAT|O_TRUNC, 0644);
     if(c->fd < 0) { free(c); return NULL; }
     c->flags = CFS_RDWR;
+    c->part_kind = -1;   /* partition cache starts unparsed */
     memcpy(c->sb.magic, CFS_MAGIC, 8);
     c->sb.version = CFS_VERSION;
     c->sb.created_at = (uint64_t)time(NULL);
@@ -108,6 +110,13 @@ CFS *cfs_create(const char *path) {
     /* Write initial superblock */
     if (cfs_sync(c) != 0) { close(c->fd); free(c); return NULL; }
     return c;
+}
+
+int cfs_set_raw(CFS *c) {
+    if (!c || !(c->flags & CFS_RDWR)) return -1;
+    c->flags |= CFS_RAW;
+    c->sb.flags |= CFS_SB_FLAG_RAW;
+    return cfs_sync(c);
 }
 
 /* ── Add file (builder API) ───────────────────────────────── */
@@ -173,6 +182,10 @@ CFS *cfs_open(const char *path, int flags) {
     c->sb.inode_size   = rd32(sb + 18);
     c->sb.file_count   = rd32(sb + 22);
     c->sb.created_at   = rd64(sb + 26);
+    c->sb.flags        = rd16(sb + 34);
+    /* container self-describes: RAW flag on disk forces uncompressed mode
+     * regardless of the caller's open flags */
+    if (c->sb.flags & CFS_SB_FLAG_RAW) c->flags |= CFS_RAW;
     c->st.file_count   = c->sb.file_count;
     if (c->sb.file_count == 0) return c;
 

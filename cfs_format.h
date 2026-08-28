@@ -27,8 +27,10 @@ typedef struct {
     uint32_t inode_size;     /* total byte size of InodeTable */
     uint32_t file_count;     /* number of entries */
     uint64_t created_at;     /* unix timestamp */
+    uint16_t flags;          /* container attributes (RAW = uncompressed) */
 } CfsSuperBlock;
-#define CFS_SB_SIZE  40   /* 8+2+8+4+4+8 = 34, padded to 40 for alignment */
+#define CFS_SB_SIZE  40   /* 8+2+8+4+4+8+2 = 36, padded to 40 for alignment */
+#define CFS_SB_FLAG_RAW 0x0001   /* whole container stored uncompressed */
 
 /* ── Inode (64 + variable path name) ───────────────────────── */
 #define CFS_MODE_FILE   0
