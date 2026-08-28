@@ -125,14 +125,15 @@ int cfs_add_file(CFS *c, const char *vpath, const void *buf, size_t size) {
     size_t cl=0; uint8_t *comp=NULL;
 
     if(c->flags & CFS_RAW){
-        /* Store uncompressed: CPEnc RAW header + raw data */
-        cl = CPENC_HEADER_SIZE + size;
+        /* Store uncompressed: CPEnc RAW header + lag byte + raw data */
+        cl = CPENC_HEADER_SIZE + 1 + size;
         comp = malloc(cl);
         if(!comp) return -1;
         CPEncHeader *rh = (CPEncHeader*)comp;
         memset(rh,0,CPENC_HEADER_SIZE);rh->magic=CPENC_MAGIC;rh->version=CPENC_VERSION;
-        rh->stride=CPENC_STRIDE_RAW;rh->original_size=(uint32_t)size;rh->compressed_size=(uint32_t)size;
-        memcpy(comp+CPENC_HEADER_SIZE, buf, size);
+        rh->stride=CPENC_STRIDE_RAW;rh->original_size=(uint32_t)size;rh->compressed_size=(uint32_t)(1+size);
+        comp[CPENC_HEADER_SIZE]=CPENC_LAG_NONE;
+        memcpy(comp+CPENC_HEADER_SIZE+1, buf, size);
     }else{
         size_t mc=cpenc_max_compressed_size(size);
         comp=malloc(mc); if(!comp)return -1;
@@ -353,13 +354,14 @@ int cfs_write(CFS *c, const char *path, const void *buf, size_t size) {
         size_t bs = bo + CFS_BLOCK_SPLIT <= size ? CFS_BLOCK_SPLIT : size - bo;
 
         if (c->flags & CFS_RAW) {
-            blks[b].cl = CPENC_HEADER_SIZE + bs;
+            blks[b].cl = CPENC_HEADER_SIZE + 1 + bs;
             blks[b].data = malloc(blks[b].cl);
             if (!blks[b].data) { ok = 0; break; }
             CPEncHeader *rh = (CPEncHeader*)blks[b].data;
             memset(rh,0,CPENC_HEADER_SIZE);rh->magic=CPENC_MAGIC;rh->version=CPENC_VERSION;
-            rh->stride=CPENC_STRIDE_RAW;rh->original_size=(uint32_t)bs;rh->compressed_size=(uint32_t)bs;
-            memcpy(blks[b].data+CPENC_HEADER_SIZE,(const uint8_t*)buf+bo,bs);
+            rh->stride=CPENC_STRIDE_RAW;rh->original_size=(uint32_t)bs;rh->compressed_size=(uint32_t)(1+bs);
+            blks[b].data[CPENC_HEADER_SIZE]=CPENC_LAG_NONE;
+            memcpy(blks[b].data+CPENC_HEADER_SIZE+1,(const uint8_t*)buf+bo,bs);
         } else {
             size_t mc = cpenc_max_compressed_size(bs);
             blks[b].data = malloc(mc);
@@ -615,13 +617,14 @@ int cfs_symlink(CFS *c, const char *target, const char *linkpath) {
 
     /* Store target string as a single uncompressed (RAW) block for simplicity */
     off_t wo = (off_t)c->sb.inode_offset;
-    uint8_t hdr[CPENC_HEADER_SIZE]; memset(hdr, 0, sizeof(hdr));
+    uint8_t hdr[CPENC_HEADER_SIZE + 1]; memset(hdr, 0, sizeof(hdr));
     CPEncHeader *h = (CPEncHeader*)hdr;
     h->magic = CPENC_MAGIC; h->version = CPENC_VERSION;
     h->stride = CPENC_STRIDE_RAW; h->original_size = (uint32_t)tl;
-    h->compressed_size = (uint32_t)tl;
-    if (pwrite(c->fd, hdr, CPENC_HEADER_SIZE, wo) != CPENC_HEADER_SIZE ||
-        pwrite(c->fd, target, tl, wo + CPENC_HEADER_SIZE) != (ssize_t)tl)
+    h->compressed_size = (uint32_t)(1 + tl);
+    hdr[CPENC_HEADER_SIZE] = CPENC_LAG_NONE;
+    if (pwrite(c->fd, hdr, CPENC_HEADER_SIZE + 1, wo) != CPENC_HEADER_SIZE + 1 ||
+        pwrite(c->fd, target, tl, wo + CPENC_HEADER_SIZE + 1) != (ssize_t)tl)
         { free(e->path); c->inode_count--; return -1; }
 
     e->raw.orig_size   = tl;
@@ -630,7 +633,7 @@ int cfs_symlink(CFS *c, const char *target, const char *linkpath) {
     e->raw.path_len    = (uint16_t)strlen(linkpath);
     e->raw.block_count = 1;
     e->raw.blocks[0].offset    = (uint64_t)wo;
-    e->raw.blocks[0].comp_size = CPENC_HEADER_SIZE + (uint32_t)tl;
+    e->raw.blocks[0].comp_size = CPENC_HEADER_SIZE + 1 + (uint32_t)tl;
     e->raw.blocks[0].orig_size = (uint32_t)tl;
     return cfs_sync(c);
 }
@@ -979,29 +982,31 @@ static int block_patch(CFS *c, InodeEntry *e, uint32_t b, const uint8_t *src,
     if (c->flags & CFS_RAW) {
         /* RAW payload = header + nolen; only in-place when size unchanged */
         if (ext) {
-            uint8_t *nc = malloc(CPENC_HEADER_SIZE + nolen);
+            uint8_t *nc = malloc(CPENC_HEADER_SIZE + 1 + nolen);
             if (!nc) { free(dec); return -1; }
             CPEncHeader *h = (CPEncHeader*)nc;
             memset(h, 0, CPENC_HEADER_SIZE);
             h->magic = CPENC_MAGIC; h->version = CPENC_VERSION;
             h->stride = CPENC_STRIDE_RAW;
-            h->original_size = nolen; h->compressed_size = nolen;
-            memcpy(nc + CPENC_HEADER_SIZE, dec, nolen);
+            h->original_size = nolen; h->compressed_size = (uint32_t)(1 + nolen);
+            nc[CPENC_HEADER_SIZE] = CPENC_LAG_NONE;
+            memcpy(nc + CPENC_HEADER_SIZE + 1, dec, nolen);
             free(dec);
-            pend_data[*np] = nc; pend_idx[*np] = b; pend_cl[*np] = CPENC_HEADER_SIZE + nolen; (*np)++;
+            pend_data[*np] = nc; pend_idx[*np] = b; pend_cl[*np] = CPENC_HEADER_SIZE + 1 + nolen; (*np)++;
             return 0;
         }
         /* rewrite the payload in place (same size) */
-        uint8_t *nc = malloc(CPENC_HEADER_SIZE + olen);
+        uint8_t *nc = malloc(CPENC_HEADER_SIZE + 1 + olen);
         if (!nc) { free(dec); return -1; }
         CPEncHeader *h = (CPEncHeader*)nc;
         memset(h, 0, CPENC_HEADER_SIZE);
         h->magic = CPENC_MAGIC; h->version = CPENC_VERSION;
         h->stride = CPENC_STRIDE_RAW;
-        h->original_size = nolen; h->compressed_size = nolen;
-        memcpy(nc + CPENC_HEADER_SIZE, dec, olen);
+        h->original_size = nolen; h->compressed_size = (uint32_t)(1 + nolen);
+        nc[CPENC_HEADER_SIZE] = CPENC_LAG_NONE;
+        memcpy(nc + CPENC_HEADER_SIZE + 1, dec, olen);
         free(dec);
-        if (pwrite(c->fd, nc, CPENC_HEADER_SIZE + olen, (off_t)blk->offset) != (ssize_t)(CPENC_HEADER_SIZE + olen))
+        if (pwrite(c->fd, nc, CPENC_HEADER_SIZE + 1 + olen, (off_t)blk->offset) != (ssize_t)(CPENC_HEADER_SIZE + 1 + olen))
             { free(nc); return -1; }
         free(nc);
         return 0;
@@ -1028,15 +1033,16 @@ static int block_patch(CFS *c, InodeEntry *e, uint32_t b, const uint8_t *src,
 static int block_hole_pack(CFS *c, const uint8_t *seg, size_t len,
                            uint8_t **out, size_t *outcl) {
     if (c->flags & CFS_RAW) {
-        *outcl = CPENC_HEADER_SIZE + len;
+        *outcl = CPENC_HEADER_SIZE + 1 + len;
         uint8_t *d = malloc(*outcl);
         if (!d) return -1;
         CPEncHeader *h = (CPEncHeader*)d;
         memset(h, 0, CPENC_HEADER_SIZE);
         h->magic = CPENC_MAGIC; h->version = CPENC_VERSION;
         h->stride = CPENC_STRIDE_RAW;
-        h->original_size = (uint32_t)len; h->compressed_size = (uint32_t)len;
-        memcpy(d + CPENC_HEADER_SIZE, seg, len);
+        h->original_size = (uint32_t)len; h->compressed_size = (uint32_t)(1 + len);
+        d[CPENC_HEADER_SIZE] = CPENC_LAG_NONE;
+        memcpy(d + CPENC_HEADER_SIZE + 1, seg, len);
         *out = d; return 0;
     }
     size_t mc = cpenc_max_compressed_size(len);
