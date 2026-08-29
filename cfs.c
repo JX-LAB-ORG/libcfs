@@ -19,8 +19,25 @@ static void wr32(uint8_t *p, uint32_t v) { p[0]=v&0xFF;p[1]=(v>>8)&0xFF;p[2]=(v>
 static void wr64(uint8_t *p, uint64_t v) { wr32(p,(uint32_t)(v&0xFFFFFFFFULL)); wr32(p+4,(uint32_t)(v>>32)); }
 static InodeEntry *lu(CFS *c,const char *path){for(uint32_t i=0;i<c->inode_count;i++)if(c->inodes[i].path&&!strcmp(c->inodes[i].path,path))return &c->inodes[i];return NULL;}
 
+/* dynamic block table helpers */
+static void inode_clear_blocks(InodeEntry *e) {
+    free(e->raw.blocks);
+    e->raw.blocks = NULL;
+    e->raw.block_count = 0;
+}
+static int inode_grow_blocks(InodeEntry *e, uint32_t n) {
+    CfsBlock *nb = realloc(e->raw.blocks, (size_t)(n ? n : 1) * sizeof(CfsBlock));
+    if (!nb) return -1;
+    if (n > e->raw.block_count)
+        memset(nb + e->raw.block_count, 0, (size_t)(n - e->raw.block_count) * sizeof(CfsBlock));
+    e->raw.blocks = nb;
+    e->raw.block_count = n;
+    return 0;
+}
+
 /* ── Write superblock + inode table to disk ────────────────────── */
 static int cfs_sync(CFS *c) {
+    if (getenv("CFS_DBG")) fprintf(stderr, "[sync] inodes=%u\n", c->inode_count);
     volatile uint64_t canary_a = 0xCAFEBABECAFEBABEULL;
     volatile uint64_t canary_b = 0xDEADBEEFDEADBEEFULL;
     if (!c || !(c->flags & CFS_RDWR)) return -1;
@@ -28,7 +45,8 @@ static int cfs_sync(CFS *c) {
     /* Serialise inode table */
     size_t ts = 0;
     for (uint32_t i = 0; i < c->inode_count; i++)
-        ts += CFS_INODE_FIXED_SIZE + c->inodes[i].raw.path_len;
+        ts += CFS_INODE_FIXED_SIZE + (size_t)c->inodes[i].raw.block_count * 16
+            + c->inodes[i].raw.path_len;
     uint8_t *tab = calloc(1, ts);
     if (!tab) return -1;
     uint8_t *op = tab;
@@ -39,7 +57,7 @@ static int cfs_sync(CFS *c) {
         wr16(op, e->raw.mode);      op += 2;
         wr16(op, e->raw.path_len);  op += 2;
         wr32(op, e->raw.block_count); op += 4;
-        for (int b = 0; b < CFS_BLOCK_MAX; b++) {
+        for (uint32_t b = 0; b < e->raw.block_count; b++) {
             wr64(op, e->raw.blocks[b].offset);     op += 8;
             wr32(op, e->raw.blocks[b].comp_size);  op += 4;
             wr32(op, e->raw.blocks[b].orig_size);  op += 4;
@@ -55,7 +73,7 @@ static int cfs_sync(CFS *c) {
     c->st.total_orig_size = 0;
     for (uint32_t i = 0; i < c->inode_count; i++) {
         c->st.total_orig_size += c->inodes[i].raw.orig_size;
-        for (uint32_t b = 0; b < c->inodes[i].raw.block_count && b < CFS_BLOCK_MAX; b++) {
+        for (uint32_t b = 0; b < c->inodes[i].raw.block_count; b++) {
             uint64_t be = c->inodes[i].raw.blocks[b].offset + c->inodes[i].raw.blocks[b].comp_size;
             if (be > data_end) data_end = be;
             c->st.total_compressed_size += c->inodes[i].raw.blocks[b].comp_size;
@@ -150,7 +168,8 @@ int cfs_add_file(CFS *c, const char *vpath, const void *buf, size_t size) {
     memset(e,0,sizeof(*e));
     e->path=strdup(vpath);
     e->raw.orig_size=size; e->raw.mtime=(uint64_t)time(NULL);
-    e->raw.mode=CFS_MODE_FILE; e->raw.path_len=(uint16_t)strlen(vpath); e->raw.block_count=1;
+    e->raw.mode=CFS_MODE_FILE; e->raw.path_len=(uint16_t)strlen(vpath);
+    if (inode_grow_blocks(e, 1) != 0) { free(e->path); c->inode_count--; free(comp); return -1; }
     e->raw.blocks[0].offset=(uint64_t)write_off;
     e->raw.blocks[0].comp_size=(uint32_t)cl;
     e->raw.blocks[0].orig_size=(uint32_t)size;
@@ -204,7 +223,11 @@ CFS *cfs_open(const char *path, int flags) {
         e->raw.mode        = rd16(p); p += 2;
         e->raw.path_len    = rd16(p); p += 2;
         e->raw.block_count = rd32(p); p += 4;
-        for (int b = 0; b < CFS_BLOCK_MAX; b++) {
+        if (e->raw.block_count > CFS_BLOCK_SANITY) goto fail;
+        e->raw.blocks = calloc(e->raw.block_count ? e->raw.block_count : 1, sizeof(CfsBlock));
+        if (!e->raw.blocks) goto fail;
+        if ((size_t)(end - p) < (size_t)e->raw.block_count * 16) goto fail;
+        for (uint32_t b = 0; b < e->raw.block_count; b++) {
             e->raw.blocks[b].offset    = rd64(p); p += 8;
             e->raw.blocks[b].comp_size = rd32(p); p += 4;
             e->raw.blocks[b].orig_size = rd32(p); p += 4;
@@ -216,11 +239,13 @@ CFS *cfs_open(const char *path, int flags) {
             p += e->raw.path_len;
         }
         c->st.total_orig_size += e->raw.orig_size;
-        for (uint32_t b = 0; b < e->raw.block_count && b < CFS_BLOCK_MAX; b++)
+        for (uint32_t b = 0; b < e->raw.block_count; b++)
             c->st.total_compressed_size += e->raw.blocks[b].comp_size;
         c->inode_count++;
     }
     free(it);
+    if (getenv("CFS_DBG")) for (uint32_t i = 0; i < c->inode_count; i++)
+        fprintf(stderr, "[open] inode %u blocks=%p n=%u\n", i, (void*)c->inodes[i].raw.blocks, c->inodes[i].raw.block_count);
     c->st.compress_ratio = c->st.total_compressed_size > 0
         ? (float)c->st.total_orig_size / (float)c->st.total_compressed_size : 1.0f;
     return c;
@@ -231,7 +256,7 @@ fail:
 void cfs_close(CFS *c) {
     if (!c) return;
     if (c->fd >= 0) close(c->fd);
-    for (uint32_t i = 0; i < c->inode_count; i++) free(c->inodes[i].path);
+    for (uint32_t i = 0; i < c->inode_count; i++) { free(c->inodes[i].path); free(c->inodes[i].raw.blocks); }
     free(c->inodes);
     free(c);
 }
@@ -246,7 +271,7 @@ ssize_t cfs_read(CFS *c,const char *path,void *buf,size_t size,off_t offset){
     size_t rem=size;if((uint64_t)(offset+size)>e->raw.orig_size)rem=(size_t)(e->raw.orig_size-(uint64_t)offset);
     size_t total=0; uint64_t cur_off=0; /* cur_off tracks position in file */
 
-    for(uint32_t b=0;b<e->raw.block_count&&b<CFS_BLOCK_MAX&&rem>0;b++){
+    for(uint32_t b=0;b<e->raw.block_count&&rem>0;b++){
         uint64_t blk_off = cur_off;
         uint64_t blk_end = cur_off + e->raw.blocks[b].orig_size;
 
@@ -332,15 +357,16 @@ int cfs_write(CFS *c, const char *path, const void *buf, size_t size) {
         e->raw.mtime = (uint64_t)time(NULL);
         e->raw.mode = CFS_MODE_FILE;
         e->raw.path_len = (uint16_t)strlen(path);
-        memset(e->raw.blocks, 0, sizeof(e->raw.blocks));
+        inode_clear_blocks(e);
         return cfs_sync(c);
     }
     if (!buf) return -1;
 
     InodeEntry *e = lu(c, path);
     int is_new = (e == NULL);
+    if (getenv("CFS_DBG")) fprintf(stderr, "[write] %s is_new=%d size=%zu\n", path, is_new, size);
     uint32_t n_blocks = (uint32_t)((size + CFS_BLOCK_SPLIT - 1) / CFS_BLOCK_SPLIT);
-    if (n_blocks > CFS_BLOCK_MAX) return -2;
+    if (n_blocks > CFS_BLOCK_SANITY) return -2;
 
     /* Allocate block metadata array */
     struct { uint8_t *data; size_t cl; } *blks =
@@ -390,7 +416,14 @@ int cfs_write(CFS *c, const char *path, const void *buf, size_t size) {
         for (uint32_t b = 0; b < n_blocks; b++) free(blks[b].data);
         free(blks); return -1;
     }
+    if (!is_new) free(e->raw.blocks);   /* overwrite: release old table */
     memset(e, 0, sizeof(*e));
+    if (inode_grow_blocks(e, n_blocks) != 0) {
+        for (uint32_t b = 0; b < n_blocks; b++) free(blks[b].data);
+        free(blks);
+        if (is_new) c->inode_count--;
+        return -1;
+    }
     e->path = strdup(path);
     if (!e->path) {
         for (uint32_t b = 0; b < n_blocks; b++) free(blks[b].data);
@@ -471,8 +504,7 @@ int cfs_mkdir(CFS *c, const char *path) {
     e->raw.mtime       = (uint64_t)time(NULL);
     e->raw.mode        = CFS_MODE_DIR;
     e->raw.path_len    = (uint16_t)strlen(path);
-    e->raw.block_count = 0;
-    memset(e->raw.blocks, 0, sizeof(e->raw.blocks));
+    inode_clear_blocks(e);
 
     return cfs_sync(c);
 }
@@ -526,7 +558,7 @@ int cfs_truncate(CFS *c, const char *path, uint64_t size) {
         e->raw.orig_size   = 0;
         e->raw.block_count = 0;
         e->raw.mtime       = (uint64_t)time(NULL);
-        memset(e->raw.blocks, 0, sizeof(e->raw.blocks));
+        inode_clear_blocks(e);
         return cfs_sync(c);
     }
 
@@ -554,7 +586,7 @@ int cfs_truncate(CFS *c, const char *path, uint64_t size) {
     /* Multi-block: truncation — shrink to fit */
     uint64_t rem = size;
     uint32_t keep = 0;
-    for (uint32_t b = 0; b < e->raw.block_count && b < CFS_BLOCK_MAX && rem > 0; b++) {
+    for (uint32_t b = 0; b < e->raw.block_count && rem > 0; b++) {
         keep++;
         if (rem <= e->raw.blocks[b].orig_size) break;
         rem -= e->raw.blocks[b].orig_size;
@@ -587,8 +619,6 @@ int cfs_truncate(CFS *c, const char *path, uint64_t size) {
         free(comp);
     }
 
-    for (uint32_t b = keep; b < CFS_BLOCK_MAX; b++)
-        memset(&e->raw.blocks[b], 0, sizeof(e->raw.blocks[b]));
     e->raw.block_count = keep;
     e->raw.orig_size   = size;
     e->raw.mtime       = (uint64_t)time(NULL);
@@ -631,7 +661,7 @@ int cfs_symlink(CFS *c, const char *target, const char *linkpath) {
     e->raw.mtime       = (uint64_t)time(NULL);
     e->raw.mode        = CFS_MODE_SYMLINK;
     e->raw.path_len    = (uint16_t)strlen(linkpath);
-    e->raw.block_count = 1;
+    if (inode_grow_blocks(e, 1) != 0) { free(e->path); c->inode_count--; return -1; }
     e->raw.blocks[0].offset    = (uint64_t)wo;
     e->raw.blocks[0].comp_size = CPENC_HEADER_SIZE + 1 + (uint32_t)tl;
     e->raw.blocks[0].orig_size = (uint32_t)tl;
@@ -740,7 +770,7 @@ int cfs_compact(CFS *c) {
         if (!e->path) continue;
         if (e->raw.block_count == 0 || e->raw.mode == CFS_MODE_DIR) continue;
 
-        for (uint32_t b = 0; b < e->raw.block_count && b < CFS_BLOCK_MAX; b++) {
+        for (uint32_t b = 0; b < e->raw.block_count; b++) {
             if (e->raw.blocks[b].comp_size == 0) continue;
             uint8_t *blk = malloc(e->raw.blocks[b].comp_size);
             if (!blk) { close(tfd); unlink(tmp); return -1; }
@@ -762,7 +792,8 @@ int cfs_compact(CFS *c) {
     /* Write inode table */
     size_t ts = 0;
     for (uint32_t i = 0; i < c->inode_count; i++)
-        ts += CFS_INODE_FIXED_SIZE + c->inodes[i].raw.path_len;
+        ts += CFS_INODE_FIXED_SIZE + (size_t)c->inodes[i].raw.block_count * 16
+            + c->inodes[i].raw.path_len;
     uint8_t *tab = calloc(1, ts);
     if (!tab) { close(tfd); unlink(tmp); return -1; }
     uint8_t *op = tab;
@@ -773,7 +804,7 @@ int cfs_compact(CFS *c) {
         wr16(op, e->raw.mode);      op += 2;
         wr16(op, e->raw.path_len);  op += 2;
         wr32(op, e->raw.block_count); op += 4;
-        for (int b = 0; b < CFS_BLOCK_MAX; b++) {
+        for (uint32_t b = 0; b < e->raw.block_count; b++) {
             wr64(op, e->raw.blocks[b].offset);     op += 8;
             wr32(op, e->raw.blocks[b].comp_size);  op += 4;
             wr32(op, e->raw.blocks[b].orig_size);  op += 4;
@@ -888,8 +919,7 @@ static void block_sizefile(CFS *c, uint64_t sz) {
     InodeEntry *e = lu(c, BLOCK_PATH);
     if(!e) return;
     e->raw.orig_size = sz;
-    e->raw.block_count = 0;
-    memset(e->raw.blocks, 0, sizeof(e->raw.blocks));
+    inode_clear_blocks(e);
     e->raw.mtime = (uint64_t)time(NULL);
     cfs_sync(c);
 }
@@ -1070,10 +1100,27 @@ static int block_write_fallback(CFS *c, const uint8_t *buf, size_t size,
     return rc;
 }
 
+#define BLOCK_CHUNK (8u << 20)   /* 8MB compression unit: bounds RMW cost */
+#define PEND_MAX 128              /* pending-patch slots per write (<=2 touched) */
+
 int cfs_block_write(CFS *c, const void *buf, size_t size, off_t offset) {
     if(!c||!buf||size==0) return -1;
     if(offset<0) return -1;
     if(!(c->flags & CFS_RDWR)) return -1;
+    /* Chunk-boundary split: a growing block would make sequential fills
+     * O(n^2) (every 1MB append recompresses the whole block).  Cut every
+     * write at an 8MB boundary so each block stays <= 8MB and every
+     * random-write RMW is bounded at 8MB. */
+    {
+        uint64_t w1 = (uint64_t)offset + size;
+        uint64_t chunk_end = ((uint64_t)offset / BLOCK_CHUNK + 1) * BLOCK_CHUNK;
+        if (w1 > chunk_end) {
+            size_t part = (size_t)(chunk_end - (uint64_t)offset);
+            if (cfs_block_write(c, buf, part, offset) != 0) return -1;
+            return cfs_block_write(c, (const uint8_t*)buf + part, size - part,
+                                   (off_t)chunk_end);
+        }
+    }
 
     /* A write into the partition-table region invalidates the parsed cache */
     if (c->part_kind != -1 && (uint64_t)offset < CFS_PART_TABLE_BYTES) {
@@ -1107,10 +1154,10 @@ int cfs_block_write(CFS *c, const void *buf, size_t size, off_t offset) {
     const uint8_t *src = (const uint8_t *)buf;
     uint64_t w0 = (uint64_t)offset, w1 = minsz;
 
-    uint8_t   *pend_data[CFS_BLOCK_MAX];
-    uint32_t   pend_idx[CFS_BLOCK_MAX];   /* block idx, or CFS_BLOCK_MAX = new block */
-    size_t     pend_cl[CFS_BLOCK_MAX];
-    size_t     pend_orig[CFS_BLOCK_MAX];  /* orig size of new blocks */
+    uint8_t   *pend_data[PEND_MAX];
+    uint32_t   pend_idx[PEND_MAX];   /* block idx, or PEND_MAX = new block */
+    size_t     pend_cl[PEND_MAX];
+    size_t     pend_orig[PEND_MAX];  /* orig size of new blocks */
     int        np = 0;
     int        nnew = 0;
 
@@ -1121,10 +1168,29 @@ int cfs_block_write(CFS *c, const void *buf, size_t size, off_t offset) {
     if (w0 >= cur_end) {
         /* Append-only: pad the gap with zeros.  A gap-free layout is
          * required (read path locates blocks by prefix sums).  A zero pad
-         * compresses to almost nothing, so this stays cheap. */
+         * compresses to almost nothing, so this stays cheap.  Split at the
+         * next 8MB boundary so no block exceeds BLOCK_CHUNK. */
+        uint64_t blk_limit = ((uint64_t)w0 / BLOCK_CHUNK + 1) * BLOCK_CHUNK;
+        if (w1 > blk_limit) {
+            size_t part = (size_t)(blk_limit - w0);
+            if (cfs_block_write(c, src, part, (off_t)w0) != 0) return -1;
+            return cfs_block_write(c, (const uint8_t*)src + part,
+                                   size - part, (off_t)blk_limit);
+        }
         uint64_t pad = w0 - cur_end;
         if (pad == 0) {
-            if (block_patch(c, e, nb - 1, src, w0, cur_end, cur_end, size,
+            if (nb > 0 && e->raw.blocks[nb-1].orig_size >= BLOCK_CHUNK) {
+                /* last block full — start a fresh one */
+                uint8_t *b2 = malloc(size);
+                if (!b2) return -1;
+                memcpy(b2, src, size);
+                int rc = block_hole_pack(c, b2, size, &pend_data[np], &pend_cl[np]);
+                free(b2);
+                if (rc != 0) goto fail_pend;
+                pend_idx[np] = PEND_MAX;
+                pend_orig[np] = size;
+                np++; nnew++;
+            } else if (block_patch(c, e, nb - 1, src, w0, cur_end, cur_end, size,
                             pend_data, pend_idx, pend_cl, &np) != 0)
                 goto fail_pend;
         } else {
@@ -1136,16 +1202,25 @@ int cfs_block_write(CFS *c, const void *buf, size_t size, off_t offset) {
             int rc = block_hole_pack(c, b2, plen + size, &pend_data[np], &pend_cl[np]);
             free(b2);
             if (rc != 0) goto fail_pend;
-            pend_idx[np] = CFS_BLOCK_MAX;
+            pend_idx[np] = PEND_MAX;
             pend_orig[np] = plen + size;
             np++; nnew++;
         }
     } else {
         /* Patch overlapping blocks; the last block may extend past its
-         * current end to absorb a tail write. */
+         * current end to absorb a tail write.  A block never grows past
+         * BLOCK_CHUNK: split the write at the block's 8MB boundary so the
+         * remainder lands in a fresh block (keeps every RMW bounded). */
         uint64_t acc = 0;
         for (uint32_t b = 0; b < nb; b++) {
             uint64_t bo = acc, be = acc + e->raw.blocks[b].orig_size;
+            uint64_t blk_limit = bo + BLOCK_CHUNK;
+            if (w1 > blk_limit && w0 < blk_limit) {
+                size_t part = (size_t)(blk_limit - w0);
+                if (cfs_block_write(c, src, part, (off_t)w0) != 0) return -1;
+                return cfs_block_write(c, (const uint8_t*)src + part,
+                                       size - part, (off_t)blk_limit);
+            }
             acc = be;
             if (be <= w0) continue;
             if (bo >= w1) break;
@@ -1163,9 +1238,13 @@ int cfs_block_write(CFS *c, const void *buf, size_t size, off_t offset) {
     }
 
     /* Block-cap exceeded → whole-file RMW fallback */
-    if (nb + (uint32_t)nnew > CFS_BLOCK_MAX) {
+    if (nb + (uint32_t)nnew > CFS_BLOCK_SANITY) {
         for (int i = 0; i < np; i++) free(pend_data[i]);
         return block_write_fallback(c, src, size, w0, minsz, prev_sz);
+    }
+    if (nnew && inode_grow_blocks(e, nb + (uint32_t)nnew) != 0) {
+        for (int i = 0; i < np; i++) free(pend_data[i]);
+        return -1;
     }
 
     /* Unified append pass: grown patches + new blocks, written at the
@@ -1179,7 +1258,7 @@ int cfs_block_write(CFS *c, const void *buf, size_t size, off_t offset) {
                 return -1;
             }
             free(pend_data[i]);
-            if (pend_idx[i] == CFS_BLOCK_MAX) {
+            if (pend_idx[i] == PEND_MAX) {
                 CfsBlock *blk = &e->raw.blocks[nb + hi];
                 memset(blk, 0, sizeof(*blk));
                 blk->offset = app; blk->comp_size = (uint32_t)pend_cl[i];

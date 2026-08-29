@@ -37,7 +37,12 @@ typedef struct {
 #define CFS_MODE_DIR    1
 #define CFS_MODE_SYMLINK 2
 
-#define CFS_BLOCK_MAX   16    /* max blocks per file */
+/* Block table is dynamic: the disk size (set by the CLI at create time)
+ * determines the block count, no hard cap.  On-disk inode layout is
+ * [orig u64][mtime u64][mode u16][path_len u16][block_count u32]
+ * [blocks x block_count x 16B][path]; the struct below is the in-memory
+ * form (blocks heap-allocated). */
+#define CFS_BLOCK_SANITY 65536   /* validation cap only, not a limit */
 
 typedef struct {
     uint64_t offset;     /* absolute offset in .cfs */
@@ -51,10 +56,9 @@ typedef struct {
     uint16_t mode;           /* CFS_MODE_FILE/DIR/SYMLINK */
     uint16_t path_len;       /* byte-length of path name */
     uint32_t block_count;    /* number of blocks (>=1 for files) */
-    CfsBlock blocks[CFS_BLOCK_MAX];
-    /* followed by 'path_len' bytes of UTF-8 path */
+    CfsBlock *blocks;        /* heap, block_count entries */
 } CfsInode;
-#define CFS_INODE_FIXED_SIZE (offsetof(CfsInode, blocks) + CFS_BLOCK_MAX * 16)
+#define CFS_INODE_FIXED_SIZE (offsetof(CfsInode, blocks))   /* disk header: 24B */
 
 /* ── DataBlock ───────────────────────────────────────────────
  * Each block is self-contained: [CPEncHeader 12B][compressed payload]
