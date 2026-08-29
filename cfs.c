@@ -37,7 +37,6 @@ static int inode_grow_blocks(InodeEntry *e, uint32_t n) {
 
 /* ── Write superblock + inode table to disk ────────────────────── */
 static int cfs_sync(CFS *c) {
-    if (getenv("CFS_DBG")) fprintf(stderr, "[sync] inodes=%u\n", c->inode_count);
     volatile uint64_t canary_a = 0xCAFEBABECAFEBABEULL;
     volatile uint64_t canary_b = 0xDEADBEEFDEADBEEFULL;
     if (!c || !(c->flags & CFS_RDWR)) return -1;
@@ -244,8 +243,6 @@ CFS *cfs_open(const char *path, int flags) {
         c->inode_count++;
     }
     free(it);
-    if (getenv("CFS_DBG")) for (uint32_t i = 0; i < c->inode_count; i++)
-        fprintf(stderr, "[open] inode %u blocks=%p n=%u\n", i, (void*)c->inodes[i].raw.blocks, c->inodes[i].raw.block_count);
     c->st.compress_ratio = c->st.total_compressed_size > 0
         ? (float)c->st.total_orig_size / (float)c->st.total_compressed_size : 1.0f;
     return c;
@@ -364,7 +361,6 @@ int cfs_write(CFS *c, const char *path, const void *buf, size_t size) {
 
     InodeEntry *e = lu(c, path);
     int is_new = (e == NULL);
-    if (getenv("CFS_DBG")) fprintf(stderr, "[write] %s is_new=%d size=%zu\n", path, is_new, size);
     uint32_t n_blocks = (uint32_t)((size + CFS_BLOCK_SPLIT - 1) / CFS_BLOCK_SPLIT);
     if (n_blocks > CFS_BLOCK_SANITY) return -2;
 
