@@ -13,53 +13,53 @@ cfs_part.o: cfs_part.c cfs_part.h cfs_internal.h cfs_format.h
 cfs_mkfs_fat32.o: cfs_mkfs_fat32.c cfs.h
 	cc $(CFLAGS) -c cfs_mkfs_fat32.c -o cfs_mkfs_fat32.o
 
-cfs_preload.so: cfs_preload.c cfs.o ../libcpool/cpenc.o
-	cc $(CFLAGS) -fPIC cfs_preload.c cfs.o ../libcpool/cpenc.o -shared -ldl -lm -o cfs_preload.so
+cfs_preload.so: cfs_preload.c cfs.o ../libcpool/cpenc.o ../libcpool/bwt.o
+	cc $(CFLAGS) -fPIC cfs_preload.c cfs.o ../libcpool/cpenc.o ../libcpool/bwt.o -shared -ldl -lm -o cfs_preload.so
 
-cfs-tool: cfs-tool.c cfs.o cfs_part.o cfs_mkfs_fat32.o cfs_mkfs_ext4.c cfs_mkfs_swap.c cfs_ext4_install.o cfs_iso9660.o ../libcpool/cpenc.o
-	cc $(CFLAGS) cfs-tool.c cfs.o cfs_part.o cfs_mkfs_fat32.o cfs_mkfs_ext4.c cfs_mkfs_swap.c cfs_ext4_install.o cfs_iso9660.o ../libcpool/cpenc.o -lm -o cfs-tool
+cfs-tool: cfs-tool.c cfs.o cfs_part.o cfs_mkfs_fat32.o cfs_mkfs_ext4.c cfs_mkfs_swap.c cfs_ext4_install.o cfs_iso9660.o ../libcpool/cpenc.o ../libcpool/bwt.o
+	cc $(CFLAGS) cfs-tool.c cfs.o cfs_part.o cfs_mkfs_fat32.o cfs_mkfs_ext4.c cfs_mkfs_swap.c cfs_ext4_install.o cfs_iso9660.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o cfs-tool
 
-cfs_block_hook.so: cfs_block_hook.c cfs.o cfs_part.o ../libcpool/cpenc.o
-	cc $(CFLAGS) -fPIC cfs_block_hook.c cfs.o cfs_part.o ../libcpool/cpenc.o -shared -ldl -lm -o cfs_block_hook.so
+cfs_block_hook.so: cfs_block_hook.c cfs.o cfs_part.o ../libcpool/cpenc.o ../libcpool/bwt.o
+	cc $(CFLAGS) -fPIC cfs_block_hook.c cfs.o cfs_part.o ../libcpool/cpenc.o ../libcpool/bwt.o -shared -ldl -lm -o cfs_block_hook.so
 
 # cfs-fuse needs libfuse3 (apk add fuse3-dev); built only where available
 HAS_FUSE := $(shell pkg-config --exists fuse3 2>/dev/null && echo yes)
 ifeq ($(HAS_FUSE),yes)
 all: cfs-fuse
-cfs-fuse: cfs-fuse.c cfs.o cfs_part.o ../libcpool/cpenc.o
-	cc $(CFLAGS) $(shell pkg-config --cflags fuse3) cfs-fuse.c cfs.o cfs_part.o ../libcpool/cpenc.o $(shell pkg-config --libs fuse3) -lm -o cfs-fuse
+cfs-fuse: cfs-fuse.c cfs.o cfs_part.o ../libcpool/cpenc.o ../libcpool/bwt.o
+	cc $(CFLAGS) $(shell pkg-config --cflags fuse3) cfs-fuse.c cfs.o cfs_part.o ../libcpool/cpenc.o ../libcpool/bwt.o $(shell pkg-config --libs fuse3) -lm -o cfs-fuse
 endif
 
 test: cfs.o
-	cc $(CFLAGS) test/cfs_test.c cfs.o ../libcpool/cpenc.o -lm -o test/cfs_test
+	cc $(CFLAGS) test/cfs_test.c cfs.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o test/cfs_test
 	./test/cfs_test
 	@echo "=== cfs_rw_test ==="
-	cc $(CFLAGS) test/cfs_rw_test.c cfs.o ../libcpool/cpenc.o -lm -o test/cfs_rw_test
+	cc $(CFLAGS) test/cfs_rw_test.c cfs.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o test/cfs_rw_test
 	./test/cfs_rw_test
 	@echo "=== cfs_dir_test ==="
-	cc $(CFLAGS) test/cfs_dir_test.c cfs.o ../libcpool/cpenc.o -lm -o test/cfs_dir_test
+	cc $(CFLAGS) test/cfs_dir_test.c cfs.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o test/cfs_dir_test
 	./test/cfs_dir_test
 	@echo "=== cfs_new_test ==="
-	cc $(CFLAGS) test/cfs_new_test.c cfs.o ../libcpool/cpenc.o -lm -o test/cfs_new_test
+	cc $(CFLAGS) test/cfs_new_test.c cfs.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o test/cfs_new_test
 	./test/cfs_new_test
 	@echo "=== cfs_compact_test ==="
-	cc $(CFLAGS) test/cfs_compact_test.c cfs.o ../libcpool/cpenc.o -lm -o test/cfs_compact_test
+	cc $(CFLAGS) test/cfs_compact_test.c cfs.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o test/cfs_compact_test
 	./test/cfs_compact_test
 	@echo "=== cfs_block_test ==="
-	cc $(CFLAGS) test/cfs_block_test.c cfs.o ../libcpool/cpenc.o -lm -o test/cfs_block_test
+	cc $(CFLAGS) test/cfs_block_test.c cfs.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o test/cfs_block_test
 	./test/cfs_block_test
 	@echo "=== cfs_part_test ==="
-	cc $(CFLAGS) test/cfs_part_test.c cfs.o cfs_part.o cfs_mkfs_ext4.c cfs_mkfs_fat32.o ../libcpool/cpenc.o -lm -o test/cfs_part_test
+	cc $(CFLAGS) test/cfs_part_test.c cfs.o cfs_part.o cfs_mkfs_ext4.c cfs_mkfs_fat32.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o test/cfs_part_test
 	./test/cfs_part_test
 	@echo "=== cfs_install_test ==="
-	cc $(CFLAGS) test/cfs_install_test.c cfs.o cfs_part.o cfs_mkfs_ext4.o cfs_ext4_install.o cfs_iso9660.o test/iso_mk.o test/ext2_read.o ../libcpool/cpenc.o -lm -o test/cfs_install_test
+	cc $(CFLAGS) test/cfs_install_test.c cfs.o cfs_part.o cfs_mkfs_ext4.o cfs_ext4_install.o cfs_iso9660.o test/iso_mk.o test/ext2_read.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o test/cfs_install_test
 	./test/cfs_install_test
 
 # Deep stress tests (random writes, block-cap fallback, part loops).
 # NOTE: known flaky under PRoot/Termux (stack-layout-sensitive corruption,
 # see PLAN.md) — run on real hardware (GCP) where ASAN is available.
 stress: cfs.o cfs_part.o
-	cc $(CFLAGS) test/cfs_stress_test.c cfs.o cfs_part.o ../libcpool/cpenc.o -lm -o test/cfs_stress_test
+	cc $(CFLAGS) test/cfs_stress_test.c cfs.o cfs_part.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o test/cfs_stress_test
 	./test/cfs_stress_test
 
 testall: test cfs-tool cfs_preload.so cfs_block_hook.so
