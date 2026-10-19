@@ -51,7 +51,7 @@ ck "$(echo "$GEO" | cut -d: -f1-3)" "255:63:8" "HDIO_GETGEO heads/sectors/cylind
 ck "$(echo "$GEO" | cut -d: -f4)" "0" "whole disk geo start"
 GEO1=$(./test/vblk_probe /dev/vda1 geo)
 ck "$(echo "$GEO1" | cut -d: -f4)" "2048" "partition geo start = 2048"
-ck "$(./test/vblk_probe /dev/vda ident)" "CFS VIRTUAL DISK" "HDIO_GET_IDENTITY model"
+ck "$(./test/vblk_probe /dev/vda ident)" "CFS SSD" "HDIO_GET_IDENTITY model (default ssd)"
 ck "$(./test/vblk_probe /dev/vda iomin)" "512" "BLKIOMIN"
 ck "$(./test/vblk_probe /dev/vda ioopt)" "4096" "BLKIOOPT"
 ck "$(./test/vblk_probe /dev/vda alignoff)" "0" "BLKALIGNOFF"

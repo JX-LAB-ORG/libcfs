@@ -5,11 +5,12 @@
  *
  * Layout (single-block-group, 4KB blocks, 256B inodes — matches
  * cfs_mkfs_ext4.c):
- *   block 0        superblock (at +1024) + group descriptor (at +2048)
- *   block 1        block bitmap
- *   block 2        inode bitmap
- *   block 3..3+ib-1 inode table (inode n at (n-1)*256)
- *   block db=3+ib  root directory data
+ *   block 0        superblock (at +1024)
+ *   block 1        group descriptor table (the block after the superblock)
+ *   block 2        block bitmap
+ *   block 3        inode bitmap
+ *   block 4..4+ib-1 inode table (inode n at (n-1)*256)
+ *   block db=4+ib  root directory data
  *   block db+1..   data (sequential allocation)
  *
  * Files and directories get a single extent each (sequential allocation,
@@ -29,8 +30,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <errno.h>
 
 #define BS 4096u
+#define BPG 32768u    /* blocks per group (8 x block_size) */
+#define FIRST_INO 11u /* s_first_ino: 1..10 are reserved */
 #define BIG_WRITE (64u * 1024u)   /* >= this size: write directly */
 
 typedef struct {
@@ -50,10 +54,14 @@ typedef struct {
     uint64_t base;
     uint32_t bc;              /* blocks in fs */
     uint32_t ic;              /* inodes in fs */
-    uint32_t ib;              /* inode table blocks */
-    uint32_t db;              /* first data block */
-    uint8_t *bbm;             /* block bitmap, bc bits */
-    uint8_t *ibm;             /* inode bitmap, ic bits */
+    uint32_t groups;          /* block groups */
+    uint32_t spg;             /* blocks per group */
+    uint32_t ipg;             /* inodes per group */
+    uint32_t itab_b;          /* inode-table blocks per group */
+    uint32_t gdt_b;           /* descriptor blocks */
+    uint32_t *bmp, *ibmp, *itab;   /* per-group locations, read from the GDT */
+    uint8_t *bbm;             /* flat block bitmap, bc bits */
+    uint8_t *ibm;             /* flat inode bitmap, ic bits */
     uint32_t next_block;
     uint32_t next_ino;
     uint32_t free_blocks, free_inodes;
@@ -62,6 +70,20 @@ typedef struct {
     DirtyBlock *dirty;
     int ndirty, dirty_cap;
 } InstCtx;
+
+static uint32_t rd32le(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+static void wr16le(uint8_t *p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
+
+/* First block after the metadata of the group `blk` belongs to.  Metadata sits
+ * at the start of every group, so anything below this is mkfs-owned and has to
+ * be read before it is modified. */
+static uint32_t meta_end(const InstCtx *x, uint32_t blk) {
+    uint32_t g = blk / BPG;
+    if (g >= x->groups) g = x->groups - 1;
+    return x->itab[g] + x->itab_b;
+}
 
 /* ── dirty-block cache ──────────────────────────────────────── */
 static DirtyBlock *cache_find(InstCtx *x, uint32_t blk) {
@@ -90,7 +112,7 @@ static int cache_set(InstCtx *x, uint32_t blk, size_t off, const void *buf, size
         d = &x->dirty[x->ndirty++];
         d->blk = blk;
         d->dirty = 0;
-        if (blk < x->db) {
+        if (blk < meta_end(x, blk)) {
             /* metadata region (sb/bitmaps/inode table) was written by mkfs —
              * read it before modifying, or we clobber e.g. inodes 1-2 */
             if (cfs_block_read(x->c, d->data, BS,
@@ -163,25 +185,37 @@ static void bm_set(uint8_t *bm, uint32_t bit) { bm[bit >> 3] |= (uint8_t)(1u << 
 
 static uint32_t alloc_blocks(InstCtx *x, uint32_t n, uint32_t *first) {
     if (!n) { *first = 0; return 0; }
-    if ((uint64_t)x->next_block + n > x->bc) return 0;
-    *first = x->next_block;
-    for (uint32_t i = 0; i < n; i++) bm_set(x->bbm, x->next_block + i);
-    x->next_block += n;
-    x->free_blocks -= n;
-    return n;
+    /* First run of n free blocks from the cursor.  Used blocks (metadata of
+     * any group, already-allocated data) are simply skipped, so this works
+     * for any group layout. */
+    uint32_t start = x->next_block, run = 0;
+    for (uint32_t b = x->next_block; b < x->bc; b++) {
+        if (x->bbm[b >> 3] & (uint8_t)(1u << (b & 7))) { run = 0; start = b + 1; continue; }
+        if (++run == n) {
+            *first = start;
+            for (uint32_t i = 0; i < n; i++) bm_set(x->bbm, start + i);
+            x->next_block = start + n;
+            x->free_blocks -= n;
+            return n;
+        }
+    }
+    return 0;
 }
 
 static uint32_t alloc_inode(InstCtx *x) {
     if (x->next_ino >= x->ic) return 0;
     uint32_t ino = x->next_ino++;
-    bm_set(x->ibm, ino);
+    bm_set(x->ibm, ino - 1);      /* bit 0 is inode 1, not inode 0 */
     x->free_inodes--;
     return ino;
 }
 
 /* ── inode IO ───────────────────────────────────────────────── */
 static uint64_t ino_off(InstCtx *x, uint32_t ino) {
-    return (uint64_t)3 * BS + (uint64_t)(ino - 1) * 256;
+    uint32_t g = (ino - 1) / x->ipg;          /* which group's inode table */
+    uint32_t idx = (ino - 1) % x->ipg;        /* index inside it */
+    if (g >= x->groups) return 0;
+    return (uint64_t)x->itab[g] * BS + (uint64_t)idx * 256;
 }
 
 static int read_inode(InstCtx *x, uint32_t ino, Ext4Inode *out) {
@@ -290,7 +324,8 @@ static int dir_add(InstCtx *x, uint32_t dir_ino, const char *name,
             ne->name_len = (uint8_t)nl;
             ne->file_type = ft;
             memcpy(ne->name, name, nl);
-            return pw(x, (uint64_t)phys * BS, blk, BS);
+            if (pw(x, (uint64_t)phys * BS, blk, BS)) return -1;
+            goto added;
         }
     }
     /* no space: grow directory and put the entry in the fresh block */
@@ -303,7 +338,15 @@ static int dir_add(InstCtx *x, uint32_t dir_ino, const char *name,
     ne->name_len = (uint8_t)nl;
     ne->file_type = ft;
     memcpy(ne->name, name, nl);
-    return pw(x, (uint64_t)nblk2 * BS, blk, BS);
+    if (pw(x, (uint64_t)nblk2 * BS, blk, BS)) return -1;
+added:
+    /* a new subdirectory is itself linked from the parent: nlink += 1 */
+    if (ft == EXT4_FT_DIR) {
+        if (read_inode(x, dir_ino, &in)) return -1;
+        in.i_links_count++;
+        if (write_inode(x, dir_ino, &in)) return -1;
+    }
+    return 0;
 }
 
 /* ── context ────────────────────────────────────────────────── */
@@ -318,22 +361,54 @@ static int ctx_init(InstCtx *x, CFS *c, uint64_t base) {
 
     x->bc = s->s_blocks_count_lo;
     x->ic = s->s_inodes_count;
-    x->ib = (x->ic * 256 + BS - 1) / BS;
-    x->db = 3 + x->ib;
-    x->free_blocks = s->s_free_blocks_count_lo;
-    x->free_inodes = s->s_free_inodes_count;
+    x->spg = s->s_blocks_per_group;
+    x->ipg = s->s_inodes_per_group;
+    if (!x->spg || !x->ipg) { errno = EINVAL; return -1; }
+    x->groups = (x->bc + x->spg - 1) / x->spg;
+    x->itab_b = ((uint64_t)x->ipg * 256 + BS - 1) / BS;
+    x->gdt_b  = ((uint64_t)x->groups * 32 + BS - 1) / BS;   /* 32-byte descriptors */
 
-    x->bbm = calloc(1, (x->bc + 7) / 8);
-    x->ibm = calloc(1, (x->ic + 7) / 8);
-    if (!x->bbm || !x->ibm) return -1;
-    if (pr(x, (uint64_t)1 * BS, x->bbm, (x->bc + 7) / 8)) return -1;
-    if (pr(x, (uint64_t)2 * BS, x->ibm, (x->ic + 7) / 8)) return -1;
+    x->bmp  = calloc(x->groups, sizeof(uint32_t));
+    x->ibmp = calloc(x->groups, sizeof(uint32_t));
+    x->itab = calloc(x->groups, sizeof(uint32_t));
+    x->bbm  = calloc(1, (x->bc + 7) / 8);
+    x->ibm  = calloc(1, (x->ic + 7) / 8);
+    if (!x->bmp || !x->ibmp || !x->itab || !x->bbm || !x->ibm) return -1;
 
-    x->next_block = x->db + 1;
+    /* Per-group locations come from the descriptor table, so whatever layout
+     * mkfs chose is honoured. */
+    uint8_t *gdt = malloc((size_t)x->gdt_b * BS);
+    if (!gdt || pr(x, (uint64_t)BS, gdt, (size_t)x->gdt_b * BS)) { free(gdt); return -1; }
+    for (uint32_t g = 0; g < x->groups; g++) {
+        const uint8_t *d = gdt + (size_t)g * 32;
+        x->bmp[g]  = rd32le(d + 0);
+        x->ibmp[g] = rd32le(d + 4);
+        x->itab[g] = rd32le(d + 8);
+    }
+    free(gdt);
+
+    /* Flatten the per-group bitmaps; group g's bitmap block is exactly the
+     * g-th slice of the flat array (same bit order). */
+    for (uint32_t g = 0; g < x->groups; g++) {
+        uint32_t bstart = g * x->spg;
+        uint32_t bn = x->bc - bstart < x->spg ? x->bc - bstart : x->spg;
+        if (pr(x, (uint64_t)x->bmp[g] * BS, x->bbm + bstart / 8, (bn + 7) / 8)) return -1;
+        if (pr(x, (uint64_t)x->ibmp[g] * BS, x->ibm + (size_t)g * x->ipg / 8,
+               (x->ipg + 7) / 8)) return -1;
+    }
+
+    /* Free counts and the cursor come from the bitmaps, not the superblock. */
+    x->free_blocks = 0;
+    for (uint32_t b = 0; b < x->bc; b++)
+        if (!(x->bbm[b >> 3] & (uint8_t)(1u << (b & 7)))) x->free_blocks++;
+    x->free_inodes = 0;
+    for (uint32_t i = 0; i < x->ic; i++)
+        if (!(x->ibm[i >> 3] & (uint8_t)(1u << (i & 7)))) x->free_inodes++;
+    x->next_block = 0;
     while (x->next_block < x->bc &&
            (x->bbm[x->next_block >> 3] & (uint8_t)(1u << (x->next_block & 7))))
         x->next_block++;
-    x->next_ino = 3;
+    x->next_ino = FIRST_INO;      /* 1..10 are reserved */
 
     x->ents_cap = 64;
     x->ents = calloc((size_t)x->ents_cap, sizeof(*x->ents));
@@ -346,19 +421,41 @@ static int ctx_init(InstCtx *x, CFS *c, uint64_t base) {
 }
 
 static int ctx_finish(InstCtx *x) {
-    /* update free counts in superblock + group descriptor */
+    uint8_t *gdt = malloc((size_t)x->gdt_b * BS);
+    if (!gdt || pr(x, (uint64_t)BS, gdt, (size_t)x->gdt_b * BS)) { free(gdt); return -1; }
+
+    /* Write every group's bitmaps back and refresh its descriptor's counts. */
+    uint32_t total_b = 0, total_i = 0;
+    for (uint32_t g = 0; g < x->groups; g++) {
+        uint32_t bstart = g * x->spg;
+        uint32_t bn = x->bc - bstart < x->spg ? x->bc - bstart : x->spg;
+        uint32_t istart = g * x->ipg;
+        uint32_t in = x->ic - istart < x->ipg ? x->ic - istart : x->ipg;
+        uint32_t fb = 0, fi = 0, i;
+        for (i = 0; i < bn; i++)
+            if (!(x->bbm[(bstart + i) >> 3] & (uint8_t)(1u << ((bstart + i) & 7)))) fb++;
+        for (i = 0; i < in; i++)
+            if (!(x->ibm[(istart + i) >> 3] & (uint8_t)(1u << ((istart + i) & 7)))) fi++;
+        total_b += fb; total_i += fi;
+        uint32_t dirs = 0;
+        for (int e = 0; e < x->nents; e++)
+            if (x->ents[e].is_dir && (x->ents[e].ino - 1) / x->ipg == g) dirs++;
+        uint8_t *d = gdt + (size_t)g * 32;
+        wr16le(d + 12, (uint16_t)(fb > 65535 ? 65535 : fb));
+        wr16le(d + 14, (uint16_t)(fi > 65535 ? 65535 : fi));
+        wr16le(d + 16, (uint16_t)(dirs > 65535 ? 65535 : dirs));
+        if (pw(x, (uint64_t)x->bmp[g] * BS, x->bbm + bstart / 8, (bn + 7) / 8)) { free(gdt); return -1; }
+        if (pw(x, (uint64_t)x->ibmp[g] * BS, x->ibm + (size_t)istart / 8, (in + 7) / 8)) { free(gdt); return -1; }
+    }
+
     uint8_t sbraw[BS];
-    if (pr(x, 0, sbraw, BS)) return -1;
+    if (pr(x, 0, sbraw, BS)) { free(gdt); return -1; }
     Ext4Super *s = (Ext4Super *)(sbraw + 1024);
-    s->s_free_blocks_count_lo = x->free_blocks;
-    s->s_free_inodes_count = x->free_inodes;
-    Ext4BgDesc *bg = (Ext4BgDesc *)(sbraw + 2048);
-    bg->bg_free_blocks_count_lo = (uint16_t)(x->free_blocks > 65535 ? 65535 : x->free_blocks);
-    bg->bg_free_inodes_count_lo = (uint16_t)(x->free_inodes > 65535 ? 65535 : x->free_inodes);
-    if (pw(x, 0, sbraw, BS)) return -1;
-    /* bitmaps + everything staged */
-    if (pw(x, (uint64_t)1 * BS, x->bbm, (x->bc + 7) / 8)) return -1;
-    if (pw(x, (uint64_t)2 * BS, x->ibm, (x->ic + 7) / 8)) return -1;
+    s->s_free_blocks_count_lo = total_b;
+    s->s_free_inodes_count = total_i;
+    if (pw(x, 0, sbraw, BS)) { free(gdt); return -1; }
+    if (pw(x, (uint64_t)BS, gdt, (size_t)x->gdt_b * BS)) { free(gdt); return -1; }
+    free(gdt);
     return cache_flush(x);
 }
 

@@ -35,7 +35,7 @@ static int extent_blocks(const Ext4Inode *in, uint32_t logblk, uint32_t *phys) {
 }
 
 static int get_inode(const WalkCtx *w, uint32_t ino, Ext4Inode *out) {
-    uint64_t off = (uint64_t)3 * BS + (uint64_t)(ino - 1) * 256;
+    uint64_t off = (uint64_t)4 * BS + (uint64_t)(ino - 1) * 256;   /* inode table starts after gdt+bitmaps */
     if (off + 256 > w->sz) return -1;
     memcpy(out, w->img + off, sizeof(*out));
     return 0;

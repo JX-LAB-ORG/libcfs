@@ -31,11 +31,46 @@ typedef struct {
 } CfsSuperBlock;
 #define CFS_SB_SIZE  40   /* 8+2+8+4+4+8+2 = 36, padded to 40 for alignment */
 #define CFS_SB_FLAG_RAW 0x0001   /* whole container stored uncompressed */
+#define CFS_SB_FLAG_REMOVABLE  0x0002  /* media behaves like USB/SD */
+#define CFS_SB_FLAG_ROTATIONAL 0x0004  /* spinning disk (0 = SSD/flash) */
+#define CFS_SB_FLAG_SD         0x0008  /* removable media is an SD card */
 
 /* ── Inode (64 + variable path name) ───────────────────────── */
 #define CFS_MODE_FILE   0
 #define CFS_MODE_DIR    1
 #define CFS_MODE_SYMLINK 2
+#define CFS_MODE_DEDUP  3   /* blocks[] hold a reference table, not content */
+
+/* ── Merge layer (content-addressed dedup) ───────────────────
+ * @store: reserved entry holding the append-only stream of unique bytes.
+ *         Ordinary file semantics (blocks are CPEnc-compressed slabs), so
+ *         the existing block table + orig_size prefix-sum lookup locate
+ *         any byte range of it unchanged.
+ *
+ * A CFS_MODE_DEDUP file's orig_size is its LOGICAL size; its blocks[]
+ * hold the serialised reference table instead of content:
+ *
+ *   [u32 n_refs][u64 logical_size]
+ *   n_refs x { uvarint gap, uvarint length, svarint store_delta }
+ *
+ *   gap         = logical      - prev_end           (prev_end starts at 0)
+ *   store_delta = store        - (prev_store+prev_length)   (starts at 0)
+ *
+ * Tuples are sorted by logical offset and non-overlapping.  Logical ranges
+ * covered by no tuple read as zeros (same hole semantics as a plain file).
+ * A reference means: logical[logical, logical+length) == store[store, +length).
+ */
+#define CFS_STORE_PATH      "@store"
+#define CFS_DEDUP_MIN_MATCH 64   /* never emit a reference shorter than this */
+#define CFS_DEDUP_BLOCK     (8u << 20)   /* reference-table block unit */
+
+/* Maintenance thresholds.  Rewriting a merged file (re-chunk, re-match) and
+ * reclaiming the store are both whole-file/whole-store passes, so they only
+ * pay off once writes have degraded the layout enough.  Checked at
+ * maintenance time (compact), never on the write path. */
+#define CFS_DEDUP_AVG_CHUNK (4u << 10)   /* CFS_CDC_MASK implies ~4KB */
+#define CFS_DEDUP_FRAG_MAX  4            /* refs*avg / logical_size; 1.0 = ideal */
+#define CFS_DEDUP_DEAD_MAX  50           /* percent of @store that is unreferenced */
 
 /* Block table is dynamic: the disk size (set by the CLI at create time)
  * determines the block count, no hard cap.  On-disk inode layout is

@@ -16,7 +16,8 @@ static void usage(const char *prog) {
         "  pack   <dir>        <out.cfs>    Pack directory into .cfs [--raw]\n"
         "  unpack <cfs>        <path> <out> Extract one file from .cfs\n"
         "  write  <cfs>        <path> <src> Write local file into .cfs\n"
-        "  mkfs   <type> <size> <cfs> [-p <n>] [-g]\n"
+        "  mkfs   <type> <size> <cfs> [-p <n>] [-g] [--disk ssd|hdd|usb|sd]\n"
+        "  disktype <cfs> [ssd|hdd|usb|sd]  Query/declare the drive identity\n"
         "  install <iso> <size> <cfs> [-p <n>] [-g]\n"
         "                                  Install ISO content into ext4\n"
         "                                  (mkfs + populate, standalone disk)\n"
@@ -32,6 +33,12 @@ static void usage(const char *prog) {
         "  symlink <cfs>       <target> <lnk> Create symlink\n"
         "  trunc  <cfs>        <path> <size> Truncate file\n"
         "  compact <cfs>                    Reclaim orphaned blocks\n"
+        "  dedup  <cfs>        [--stats] [--dry] [--no-compact] [--gc]\n"
+        "                                  Content-addressed merge (dedup);\n"
+        "                                  compacts at the end unless --no-compact;\n"
+        "                                  --gc reclaims once past the thresholds\n"
+        "                                  --stats: print merge statistics\n"
+        "                                  --dry:   stats only, do not merge\n"
         "  partlabel <cfs> <mbr|gpt|none> [--force]\n"
         "                                  Create/remove partition table\n"
         "  partadd  <cfs> <type> <start> <end> [--boot] [--guid <GUID>]\n"
@@ -370,10 +377,12 @@ int main(int argc, char *argv[]) {
         }
         const char *fstype = argv[2], *size_str = argv[3], *out = argv[4];
         int part = 0, gpt = 0, raw = 0;
+        const char *disk_kind = NULL;
         for (int i = 5; i < argc; i++) {
             if (!strcmp(argv[i], "-p") && i + 1 < argc) part = atoi(argv[++i]);
             else if (!strcmp(argv[i], "-g")) gpt = 1;
             else if (!strcmp(argv[i], "--raw")) raw = 1;
+            else if (!strcmp(argv[i], "--disk") && i + 1 < argc) disk_kind = argv[++i];
         }
 
         int is_ext4 = !strcmp(fstype, "ext4");
@@ -401,6 +410,18 @@ int main(int argc, char *argv[]) {
         CFS *c = cfs_create(out);
         if (!c) { perror(out); return 1; }
         if (raw && cfs_set_raw(c) != 0) { fprintf(stderr, "mkfs: set raw failed\n"); cfs_close(c); unlink(out); return 1; }
+        if (disk_kind) {
+            /* The image declares what kind of drive it is; the hook and
+             * virt-kernel's device models report it to the guest. */
+            int k = !strcmp(disk_kind, "ssd") ? CFS_DISK_SSD :
+                    !strcmp(disk_kind, "hdd") ? CFS_DISK_HDD :
+                    !strcmp(disk_kind, "usb") ? CFS_DISK_USB :
+                    !strcmp(disk_kind, "sd")  ? CFS_DISK_SD : -1;
+            if (k < 0 || cfs_disk_set(c, k) != 0) {
+                fprintf(stderr, "mkfs: bad --disk '%s' (ssd|hdd|usb|sd)\n", disk_kind);
+                cfs_close(c); unlink(out); return 1;
+            }
+        }
 
         int rc;
         cfs_block_resize(c, disk_sz);
@@ -690,6 +711,118 @@ int main(int argc, char *argv[]) {
         else printf("compact ok\n");
         cfs_close(c);
         return rc ? 1 : 0;
+    }
+
+    if (!strcmp(cmd, "dedup")) {
+        /* cfs-tool dedup <cfs> [--stats] [--dry]
+         * Merge plain files into the shared @store (content-addressed dedup).
+         * --dry reads stats only; a real merge needs the container RDWR. */
+        if (argc < 3) { usage(argv[0]); return 1; }
+        const char *cfs_path = argv[2];
+        int show_stats = 0, dry = 0, no_compact = 0, gc = 0;
+        for (int i = 3; i < argc; i++) {
+            if (!strcmp(argv[i], "--stats")) show_stats = 1;
+            else if (!strcmp(argv[i], "--dry")) dry = 1;
+            else if (!strcmp(argv[i], "--no-compact")) no_compact = 1;
+            else if (!strcmp(argv[i], "--gc")) gc = 1;
+            else { fprintf(stderr, "dedup: unknown option '%s'\n", argv[i]); return 1; }
+        }
+
+        CFS *c = cfs_open(cfs_path, dry ? CFS_RDONLY : CFS_RDWR);
+        if (!c) { perror(cfs_path); return 1; }
+
+        if (gc && !dry) {
+            CfsDedupGcStats gs;
+            if (cfs_dedup_gc(c, &gs) != 0) {
+                fprintf(stderr, "dedup: gc failed\n");
+                cfs_close(c);
+                return 1;
+            }
+            printf("dedup --gc: refrag=%u dead=%llu store %llu -> %llu\n",
+                   gs.refrag_files, (unsigned long long)gs.dead_bytes,
+                   (unsigned long long)gs.store_before, (unsigned long long)gs.store_after);
+            if (gs.store_after == 0)
+                printf("  (below the maintenance thresholds — nothing reclaimed)\n");
+            cfs_close(c);
+            return 0;
+        }
+
+        if (!dry) {
+            int rc = cfs_dedup_merge(c);
+            if (rc) {
+                fprintf(stderr, "dedup: merge failed (%d)\n", rc);
+                cfs_close(c);
+                return 1;
+            }
+        }
+
+        CfsDedupStats ds;
+        if (cfs_dedup_stats(c, &ds) != 0) {
+            fprintf(stderr, "dedup: stats failed\n");
+            cfs_close(c);
+            return 1;
+        }
+
+        printf("%s: merged=%u skipped=%u logical=%llu store=%llu\n",
+               dry ? "dedup (dry run)" : "dedup",
+               ds.merged_files, ds.skipped,
+               (unsigned long long)ds.logical_bytes,
+               (unsigned long long)ds.store_bytes);
+
+        if (show_stats || dry) {
+            double ratio = ds.store_bytes > 0
+                ? (double)ds.logical_bytes / (double)ds.store_bytes : 1.0;
+            printf("  merged files:    %u\n", ds.merged_files);
+            printf("  skipped:         %u\n", ds.skipped);
+            printf("  logical bytes:   %llu\n", (unsigned long long)ds.logical_bytes);
+            printf("  store bytes:     %llu\n", (unsigned long long)ds.store_bytes);
+            printf("  table bytes:     %llu\n", (unsigned long long)ds.table_bytes);
+            printf("  effective ratio: %.2fx\n", ratio);
+        }
+
+        /* A merge moves every file's bytes into @store and leaves the old
+         * content blocks orphaned, so the container roughly doubles until a
+         * compact reclaims them.  Do it here unless asked not to. */
+        if (!dry && !no_compact) {
+            struct stat sb;
+            long long before = stat(cfs_path, &sb) == 0 ? (long long)sb.st_size : -1;
+            if (cfs_compact(c) != 0) {
+                fprintf(stderr, "dedup: compact failed — run 'cfs-tool compact' to reclaim orphans\n");
+            } else if (before >= 0 && stat(cfs_path, &sb) == 0) {
+                printf("  compacted:       %lld -> %lld bytes\n", before, (long long)sb.st_size);
+            }
+        } else if (!dry) {
+            printf("  note: orphaned content blocks remain — run 'cfs-tool compact'\n");
+        }
+        cfs_close(c);
+        return 0;
+    }
+
+    if (!strcmp(cmd, "disktype")) {
+        /* cfs-tool disktype <cfs> [ssd|hdd|usb|sd] — query or declare the
+         * drive identity the container carries. */
+        if (argc < 3) { usage(argv[0]); return 1; }
+        CFS *c = cfs_open(argv[2], argc > 3 ? CFS_RDWR : CFS_RDONLY);
+        if (!c) { perror(argv[2]); return 1; }
+        if (argc > 3) {
+            const char *k = argv[3];
+            int kind = !strcmp(k, "ssd") ? CFS_DISK_SSD :
+                       !strcmp(k, "hdd") ? CFS_DISK_HDD :
+                       !strcmp(k, "usb") ? CFS_DISK_USB :
+                       !strcmp(k, "sd")  ? CFS_DISK_SD : -1;
+            if (kind < 0 || cfs_disk_set(c, kind) != 0) {
+                fprintf(stderr, "disktype: bad kind '%s' (ssd|hdd|usb|sd)\n", k);
+                cfs_close(c); return 1;
+            }
+        }
+        CfsDiskAttrs a;
+        if (cfs_disk_get(c, &a) != 0) { cfs_close(c); return 1; }
+        printf("%s: kind=%s removable=%d rotational=%d model=\"%s\"\n", argv[2],
+               a.kind == CFS_DISK_SSD ? "ssd" : a.kind == CFS_DISK_HDD ? "hdd" :
+               a.kind == CFS_DISK_USB ? "usb" : "sd",
+               a.removable, a.rotational, a.model);
+        cfs_close(c);
+        return 0;
     }
 
     usage(argv[0]);

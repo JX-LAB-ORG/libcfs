@@ -52,11 +52,64 @@ int    cfs_chown(CFS *cfs, const char *path, uint32_t uid, uint32_t gid);
 int    cfs_compact(CFS *cfs);
 int    cfs_unpack(CFS *cfs, const char *cfs_path, const char *local_path);
 
+/* ─── Merge layer (content-addressed dedup) ──────────────────
+ * cfs_dedup_merge() walks every plain file, moves its bytes into the
+ * shared @store stream and rewrites the inode as a reference table.
+ * Step 1 stores each file as a single whole-file reference (plumbing
+ * only, no matching); feature matching lands on top of the same tables. */
+typedef struct {
+    uint32_t merged_files;   /* files converted to reference tables */
+    uint32_t skipped;        /* files left alone (empty/dirs/reserved) */
+    uint64_t logical_bytes;  /* bytes now served through references */
+    uint64_t store_bytes;    /* bytes appended to @store */
+    uint64_t table_bytes;    /* serialised reference-table bytes */
+} CfsDedupStats;
+
+typedef struct {
+    uint32_t refrag_files;   /* files rebuilt because they fragmented */
+    uint64_t dead_bytes;     /* unreferenced @store bytes found */
+    uint64_t store_before;   /* @store size entering the reclamation */
+    uint64_t store_after;    /* @store size leaving it (0 = no pass run) */
+} CfsDedupGcStats;
+
+int    cfs_dedup_merge(CFS *cfs);
+int    cfs_dedup_stats(CFS *cfs, CfsDedupStats *out);
+/* Threshold-driven maintenance: rebuild the tables that fragmented past
+ * CFS_DEDUP_FRAG_MAX and drop @store bytes nothing references once they pass
+ * CFS_DEDUP_DEAD_MAX.  Never runs on the write path. */
+int    cfs_dedup_gc(CFS *cfs, CfsDedupGcStats *out);
+/* Write into a file that cfs_dedup_merge() turned into a reference table.
+ * Identical bytes are a no-op; otherwise the range is chunked, matched
+ * against the feature index and the misses appended to @store. */
+ssize_t cfs_dedup_write(CFS *cfs, const char *path, const void *buf,
+                        size_t size, off_t offset);
+
 /* ─── Block Device Layer ───────────────────────────────────── */
 ssize_t cfs_block_read(CFS *cfs, void *buf, size_t size, off_t offset);
 int     cfs_block_write(CFS *cfs, const void *buf, size_t size, off_t offset);
 uint64_t cfs_block_size(CFS *cfs);
 int     cfs_block_resize(CFS *cfs, uint64_t size);
+
+/* ─── Disk identity ────────────────────────────────────────────
+ * Declared when the container is created, carried by the container itself:
+ * the image says what kind of drive it is, the way a USB stick carries its
+ * own identity.  The hook and virt-kernel's device models report it.  This
+ * is device metadata, not disk content — no formatter can put it in a
+ * filesystem, which is why it lives in the superblock. */
+#define CFS_DISK_SSD 0   /* fixed, non-rotating */
+#define CFS_DISK_HDD 1   /* fixed, spinning */
+#define CFS_DISK_USB 2   /* removable flash drive */
+#define CFS_DISK_SD  3   /* removable SD card */
+
+typedef struct {
+    int  kind;         /* CFS_DISK_* */
+    int  removable;    /* USB/SD style removable media */
+    int  rotational;   /* spinning disk vs SSD/flash */
+    char model[24];    /* derived from the kind */
+} CfsDiskAttrs;
+
+int cfs_disk_set(CFS *cfs, int kind);
+int cfs_disk_get(CFS *cfs, CfsDiskAttrs *out);
 
 /* ─── Partition layer (standard MBR/GPT inside @block) ─────── */
 typedef struct {

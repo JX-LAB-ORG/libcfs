@@ -1220,7 +1220,7 @@ int fstatfs(int fd, struct statfs *s) {
     LOAD(_fsfs, "fstatfs");
     return _fsfs(fd, s);
 }
-int statvfs(const char *p, struct statvfs *s) {
+static int fake_vfs(struct statvfs *s) {
     if (!s) { errno = EFAULT; return -1; }
     memset(s, 0, sizeof(*s));
     s->f_bsize   = 4096;
@@ -1233,7 +1233,8 @@ int statvfs(const char *p, struct statvfs *s) {
     s->f_namemax = 255;
     return 0;
 }
-int fstatvfs(int fd, struct statvfs *s) { return statvfs(NULL, s); }
+int statvfs(const char *p, struct statvfs *s) { (void)p; return fake_vfs(s); }
+int fstatvfs(int fd, struct statvfs *s) { (void)fd; return fake_vfs(s); }
 
 /* ═══════════════════════════════════════════════════════════════════
    fsync / fdatasync / sync — no-op

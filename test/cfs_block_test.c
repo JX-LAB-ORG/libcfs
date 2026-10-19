@@ -238,6 +238,27 @@ static void test_cpenc_diag(void) {
     }
 }
 
+/* ── Test 7: disk identity carried by the container ── */
+static void test_disk_identity(void) {
+    printf("[t7] disk identity (ssd/hdd/usb/sd)\n");
+    unlink(PATH);
+    CFS *c = cfs_create(PATH);
+    CHK(c != NULL, "identity: create");
+    if (!c) return;
+    CfsDiskAttrs a;
+    CHK(cfs_disk_get(c, &a) == 0 && a.kind == CFS_DISK_SSD, "identity: default ssd");
+    CHK(cfs_disk_set(c, CFS_DISK_SD) == 0, "identity: set sd");
+    CHK(cfs_disk_get(c, &a) == 0 && a.kind == CFS_DISK_SD && a.removable && !a.rotational
+        && !strcmp(a.model, "CFS SD Card"), "identity: reports sd card");
+    CHK(cfs_disk_set(c, 99) != 0, "identity: rejects bad kind");
+    cfs_close(c);
+    c = cfs_open(PATH, CFS_RDONLY);
+    CHK(c != NULL && cfs_disk_get(c, &a) == 0 && a.kind == CFS_DISK_SD,
+        "identity: persists across reopen");
+    if (c) cfs_close(c);
+    unlink(PATH);
+}
+
 int main(void) {
     test_cpenc_diag();
     test_shrink_regression();
@@ -246,6 +267,7 @@ int main(void) {
     test_hole_does_not_touch();
     test_out_of_order_holes();
     test_raw_mode();
+    test_disk_identity();
     printf("\n=== %d failures ===\n", failed);
     return failed ? 1 : 0;
 }

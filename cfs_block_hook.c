@@ -45,6 +45,13 @@ extern uint64_t cfs_block_size(CFS *c);
 extern int      cfs_part_count(CFS *c);
 extern int      cfs_part_get(CFS *c, int idx, CfsPartition *out);
 extern void     cfs_part_invalidate(CFS *c);
+typedef struct {              /* mirrors CfsDiskAttrs in cfs.h */
+    int  kind;
+    int  removable;
+    int  rotational;
+    char model[24];
+} CfsDiskAttrs;
+extern int      cfs_disk_get(CFS *c, CfsDiskAttrs *out);
 
 /* ── State ──────────────────────────────────────────────────── */
 static char blk_dev[256], blk_file[512];
@@ -144,6 +151,31 @@ __attribute__((destructor)) static void _fin(void) {
 /* ═══════════════════════════════════════════════════════════════
    open family
    ═══════════════════════════════════════════════════════════════ */
+/* The drive's own sysfs attributes, served for whoever reads the exact
+ * paths (lsblk-style directory enumeration belongs to a real device model,
+ * not to a preload shim). */
+static const char *blk_sysfs_content(const char *p) {
+    static char buf[24];
+    if (!blk_dev[0] || !blk_cfs) return NULL;
+    const char *base = strrchr(blk_dev, '/');
+    base = base ? base + 1 : blk_dev;
+    CfsDiskAttrs a;
+    if (cfs_disk_get(blk_cfs, &a) != 0) return NULL;
+    char path[360];
+    snprintf(path, sizeof(path), "/sys/block/%s/queue/rotational", base);
+    if (!strcmp(p, path)) { snprintf(buf, sizeof(buf), "%d\n", a.rotational); return buf; }
+    snprintf(path, sizeof(path), "/sys/block/%s/removable", base);
+    if (!strcmp(p, path)) { snprintf(buf, sizeof(buf), "%d\n", a.removable); return buf; }
+    snprintf(path, sizeof(path), "/sys/block/%s/size", base);
+    if (!strcmp(p, path)) {
+        snprintf(buf, sizeof(buf), "%llu\n",
+                 (unsigned long long)(cfs_block_size(blk_cfs) / 512));
+        return buf;
+    }
+    return NULL;
+}
+
+
 int open(const char *p, int flags, ...) {
     LOAD(_o, "open");
     int part = 0; uint64_t pstart = 0, psize = 0;
@@ -156,6 +188,18 @@ int open(const char *p, int flags, ...) {
         return fd;
     }
     if (r < 0) return -1;   /* partition path, lookup failed → ENOENT */
+    {
+        const char *sc = blk_sysfs_content(p);
+        if (sc) {
+            int fd = (int)syscall(SYS_memfd_create, "cfs-sysfs", 0);
+            if (fd < 0) return -1;
+            size_t n = strlen(sc);
+            if (write(fd, sc, n) != (ssize_t)n) { close(fd); return -1; }
+            lseek(fd, 0, SEEK_SET);
+            _DBG("OPEN %s -> memfd %d (%s)", p, fd, sc);
+            return fd;
+        }
+    }
     va_list ap; va_start(ap, flags); mode_t m = va_arg(ap, mode_t); va_end(ap);
     return _o(p, flags, m);
 }
@@ -247,7 +291,13 @@ off_t lseek64(int fd, off_t o, int w) { return lseek(fd, o, w); }
 /* ═══════════════════════════════════════════════════════════════
    ioctl
    ═══════════════════════════════════════════════════════════════ */
+/* glibc declares the request as unsigned long, musl as int — match whichever
+ * this is, or the definition conflicts with the header's prototype. */
+#if defined(__GLIBC__)
+int ioctl(int fd, unsigned long req, ...) {
+#else
 int ioctl(int fd, int req, ...) {
+#endif
     BlkFd *bf = blk_fd_get(fd);
     if (!bf) {
         va_list ap; va_start(ap, req); void *a = va_arg(ap, void*); va_end(ap);
@@ -310,15 +360,22 @@ int ioctl(int fd, int req, ...) {
     }
     case HDIO_GET_IDENTITY: {
         /* ATA identify block: serial @20, firmware @46, model @54,
-         * all space-padded to fixed widths */
+         * all space-padded to fixed widths.  The model comes from the
+         * container's own disk identity, so an image declared as an SD card
+         * reports itself as one. */
         unsigned char *id = a;
+        CfsDiskAttrs da;
+        const char *model = "CFS VIRTUAL DISK";
+        if (blk_cfs && cfs_disk_get(blk_cfs, &da) == 0) model = da.model;
         memset(id, 0, 512);
         memset(id + 20, ' ', 20);
         memcpy(id + 20, "CFS0001", 7);
         memset(id + 46, ' ', 8);
         memcpy(id + 46, "v3.1", 4);
         memset(id + 54, ' ', 40);
-        memcpy(id + 54, "CFS VIRTUAL DISK", sizeof("CFS VIRTUAL DISK") - 1);
+        size_t ml = strlen(model);
+        if (ml > 40) ml = 40;
+        memcpy(id + 54, model, ml);
         return 0;
     }
     default: _DBG("  UNKNOWN IOCTL"); errno = ENOTTY; return -1;
@@ -354,9 +411,21 @@ int stat(const char *p, struct stat *st) {
         return 0;
     }
     if (r < 0) { errno = ENOENT; return -1; }
+    {
+        const char *sc = blk_sysfs_content(p);
+        if (sc) {
+            memset(st, 0, sizeof(*st));
+            st->st_mode = S_IFREG | 0444;
+            st->st_size = (off_t)strlen(sc);
+            st->st_blksize = 4096;
+            st->st_blocks = 1;
+            return 0;
+        }
+    }
     LOAD(_st, "stat"); return _st(p, st);
 }
 int lstat(const char *p, struct stat *st) { return stat(p, st); }
+
 int __xstat(int v, const char *p, struct stat *s)   { (void)v; return stat(p, s); }
 int __xstat64(int v, const char *p, struct stat *s)  { (void)v; return stat(p, s); }
 int __lxstat(int v, const char *p, struct stat *s)   { (void)v; return stat(p, s); }

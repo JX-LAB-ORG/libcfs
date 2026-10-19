@@ -240,7 +240,6 @@ static const struct fuse_operations cfs_ops = {
 
 /* ── Main ──────────────────────────────────────────────────────── */
 int main(int argc, char *argv[]) {
-    struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
 
     if (argc < 2) {
         fprintf(stderr, "Usage: %s [options] <cfs_file> <mount_point>\n", argv[0]);
@@ -250,9 +249,10 @@ int main(int argc, char *argv[]) {
 
     /* Extract cfs file and mount point from args */
     const char *cfs_file = NULL, *mount_pt = NULL;
+    int cfs_idx = -1;
     for (int i = 1; i < argc; i++) {
         if (argv[i][0] != '-') {
-            if (!cfs_file) cfs_file = argv[i];
+            if (!cfs_file) { cfs_file = argv[i]; cfs_idx = i; }
             else if (!mount_pt) mount_pt = argv[i];
         }
     }
@@ -280,8 +280,16 @@ int main(int argc, char *argv[]) {
     if (cfs_flags & CFS_RAW) fprintf(stderr, " (RAW storage)");
     fprintf(stderr, "\n");
 
-    /* Run FUSE main loop */
-    int rc = fuse_main(args.argc, args.argv, &cfs_ops, NULL);
+    /* Run FUSE main loop.  libfuse takes exactly one positional argument (the
+     * mount point); hand it a clean argument vector with the container path
+     * removed, or it reads the container as the mount point and fails with
+     * EINVAL. */
+    struct fuse_args fargs = FUSE_ARGS_INIT(0, NULL);
+    fuse_opt_add_arg(&fargs, argv[0]);
+    for (int i = 1; i < argc; i++)
+        if (i != cfs_idx) fuse_opt_add_arg(&fargs, argv[i]);
+    int rc = fuse_main(fargs.argc, fargs.argv, &cfs_ops, NULL);
+    fuse_opt_free_args(&fargs);
     cfs_close(cfs_ctx);
     return rc;
 }

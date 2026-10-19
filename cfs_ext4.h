@@ -166,6 +166,15 @@ typedef struct __attribute__((packed)) {
     uint32_t i_file_acl_lo;
     uint32_t i_size_high;
     uint32_t i_obso_faddr;
+    /* osd2 (linux) — 12 bytes.  These hold the high halves of blocks/acl/uid/
+     * gid; leaving them out shifts every later field 12 bytes early, which
+     * puts i_extra_isize on top of l_i_blocks_high. */
+    uint16_t i_blocks_high;
+    uint16_t i_file_acl_high;
+    uint16_t i_uid_high;
+    uint16_t i_gid_high;
+    uint16_t i_checksum_lo;
+    uint16_t i_osd2_reserved;
     uint16_t i_extra_isize;
     uint16_t i_checksum_hi;
     uint32_t i_ctime_extra;

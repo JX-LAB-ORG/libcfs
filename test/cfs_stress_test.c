@@ -103,8 +103,10 @@ static void test_block_cap_fallback(void) {
     cfs_block_resize(c, DISK_SZ);
 
     /* 17 scattered writes: first 16 create blocks, the 17th must exceed
-     * the cap and fall back to whole-file RMW */
-    uint8_t buf[512];
+     * the cap and fall back to whole-file RMW.  buf must cover the largest
+     * write below (1024) — sizing it at 512 overflowed the stack and the
+     * corruption surfaced later, which is what made this test look flaky. */
+    uint8_t buf[1024];
     for (int i = 0; i < 17; i++) {
         uint64_t off = (uint64_t)i * (DISK_SZ / 20) + 10;   /* scattered, gap-growing */
         for (size_t j = 0; j < 512; j++) buf[j] = (uint8_t)(i * 31 + j);

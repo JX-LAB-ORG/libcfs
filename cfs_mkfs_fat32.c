@@ -70,11 +70,21 @@ int cfs_mkfs_fat32_at(CFS *c, uint64_t base_off, uint64_t size) {
     else if (size >= 260ULL * 1024 * 1024) spc = 8;        /* 4KB */
     else spc = 4;                                          /* 2KB */
 
+    /* FAT32 is only legal with at least 65525 clusters; below that it is
+     * FAT16 territory.  Shrink the cluster until the floor is met (a 64MB
+     * volume needs 512-byte clusters) and refuse if even 512B cannot. */
     uint64_t total_sects = size / FAT_SECTOR;
-    uint32_t fat_sz = (uint32_t)(((total_sects / spc + 2) * 4 + FAT_SECTOR - 1) / FAT_SECTOR);
-    uint64_t data_start = FAT_RSVD + 2ULL * fat_sz;
-    uint64_t clusters = (total_sects - data_start) / spc;
-    if (clusters > 0x0FFFFFF5) return -1;
+    uint32_t fat_sz;
+    uint64_t data_start, clusters;
+    for (;;) {
+        fat_sz = (uint32_t)(((total_sects / spc + 2) * 4 + FAT_SECTOR - 1) / FAT_SECTOR);
+        if (total_sects <= FAT_RSVD + 2ULL * fat_sz) return -1;
+        data_start = FAT_RSVD + 2ULL * fat_sz;
+        clusters = (total_sects - data_start) / spc;
+        if (clusters >= 65525 || spc == 1) break;
+        spc >>= 1;
+    }
+    if (clusters < 65525 || clusters > 0x0FFFFFF5) return -1;
 
     /* Build BPB */
     uint8_t *bs = calloc(1, FAT_SECTOR);
@@ -103,7 +113,10 @@ int cfs_mkfs_fat32_at(CFS *c, uint64_t base_off, uint64_t size) {
     b->drive_num = 0x80;
     b->sig = 0x29;
     le32((uint8_t *)&b->vol_id, (uint32_t)(time(NULL) ^ (uint32_t)getpid()));
-    memcpy(b->vol_label, "CFS-DISK  ", 11);
+    /* 11 bytes, space padded, no NUL — a trailing NUL makes fsck declare the
+     * label invalid, and the root directory must carry the same label. */
+    static const char label[11] = { 'C','F','S','-','D','I','S','K',' ',' ',' ' };
+    memcpy(b->vol_label, label, 11);
     memcpy(b->fs_type, "FAT32   ", 8);
     b->boot_sig = 0xAA55;
 
@@ -125,12 +138,21 @@ int cfs_mkfs_fat32_at(CFS *c, uint64_t base_off, uint64_t size) {
     le32(fat + 8, FAT_EOF);   /* cluster 2 = root dir */
     uint64_t free_c = clusters - 1;
 
+    /* Root directory: the volume-label record.  The boot sector carries the
+     * same label; without a matching entry fsck.fat calls it invalid. */
+    uint8_t root[FAT_SECTOR];
+    memset(root, 0, sizeof(root));
+    memcpy(root, label, 11);
+    root[11] = 0x08;                       /* ATTR_VOLUME_ID */
+
     int rc = 0;
     if (cfs_block_write(c, bs, FAT_SECTOR, (off_t)base_off) != 0 ||
         cfs_block_write(c, fi, sizeof(fi), (off_t)(base_off + FAT_FSINFO * FAT_SECTOR)) != 0 ||
         cfs_block_write(c, bs, FAT_SECTOR, (off_t)(base_off + FAT_BACKUP * FAT_SECTOR)) != 0 ||
+        cfs_block_write(c, fi, sizeof(fi), (off_t)(base_off + (FAT_BACKUP + 1) * FAT_SECTOR)) != 0 ||
         cfs_block_write(c, fat, fat_bytes, (off_t)(base_off + FAT_RSVD * FAT_SECTOR)) != 0 ||
-        cfs_block_write(c, fat, fat_bytes, (off_t)(base_off + (FAT_RSVD + fat_sz) * FAT_SECTOR)) != 0)
+        cfs_block_write(c, fat, fat_bytes, (off_t)(base_off + (FAT_RSVD + fat_sz) * FAT_SECTOR)) != 0 ||
+        cfs_block_write(c, root, FAT_SECTOR, (off_t)(base_off + data_start * FAT_SECTOR)) != 0)
         rc = -1;
     free(bs);
     free(fat);
