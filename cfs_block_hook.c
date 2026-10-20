@@ -42,6 +42,7 @@ extern CFS     *cfs_open(const char *p, int f);
 extern void     cfs_close(CFS *c);
 extern ssize_t  cfs_block_read(CFS *c, void *b, size_t s, off_t o);
 extern int      cfs_block_write(CFS *c, const void *b, size_t s, off_t o);
+extern ssize_t  cfs_block_write_some(CFS *c, const void *b, size_t s, off_t o);
 extern uint64_t cfs_block_size(CFS *c);
 extern int      cfs_part_count(CFS *c);
 extern int      cfs_part_get(CFS *c, int idx, CfsPartition *out);
@@ -248,24 +249,27 @@ ssize_t pread64(int fd, void *b, size_t n, off_t o) { return pread(fd, b, n, o);
  * — is a full disk, not an I/O error.  The return code is the direct signal;
  * errno is the backstop for the paths that collapse it into -1 (the dedup
  * append does, and it sets errno on the way out). */
-static void blk_wfail(int rc) { errno = (rc == CFS_ENOSPC || errno == ENOSPC) ? ENOSPC : EIO; }
+static void blk_wfail(void) { errno = (errno == ENOSPC) ? ENOSPC : EIO; }
 
 ssize_t write(int fd, const void *buf, size_t n) {
     BlkFd *bf = blk_fd_get(fd);
     if (!bf) { LOAD(_w, "write"); return _w(fd, buf, n); }
     _DBG("WRITE fd=%d n=%zu off=%lld", fd, n, (long long)bf->pos);
-    int rc = cfs_block_write(blk_cfs, buf, n, (off_t)(bf->pstart + (uint64_t)bf->pos));
-    if (rc != 0) { blk_wfail(rc); return -1; }
-    bf->pos += (off_t)n;
-    return (ssize_t)n;
+    /* Short writes are normal for a device that ran out of room: land what
+     * fits and report that count, the way a real disk does, instead of
+     * failing a write whose early part is already on the platter. */
+    ssize_t got = cfs_block_write_some(blk_cfs, buf, n, (off_t)(bf->pstart + (uint64_t)bf->pos));
+    if (got < 0) { blk_wfail(); return -1; }
+    bf->pos += (off_t)got;
+    return got;
 }
 ssize_t pwrite(int fd, const void *buf, size_t n, off_t off) {
     BlkFd *bf = blk_fd_get(fd);
     if (!bf) { static ssize_t (*_pw)(int,const void*,size_t,off_t); LOAD(_pw, "pwrite"); return _pw(fd, buf, n, off); }
     _DBG("PWRITE fd=%d off=%lld n=%zu", fd, (long long)off, n);
-    int rc = cfs_block_write(blk_cfs, buf, n, (off_t)(bf->pstart + (uint64_t)off));
-    if (rc != 0) { blk_wfail(rc); return -1; }
-    return (ssize_t)n;
+    ssize_t got = cfs_block_write_some(blk_cfs, buf, n, (off_t)(bf->pstart + (uint64_t)off));
+    if (got < 0) { blk_wfail(); return -1; }
+    return got;
 }
 ssize_t pwrite64(int fd, const void *b, size_t n, off_t o) { return pwrite(fd, b, n, o); }
 
@@ -325,19 +329,19 @@ int ioctl(int fd, int req, ...) {
     case BLKIOOPT: *(unsigned int*)a = 4096; return 0;
     case BLKALIGNOFF: *(int*)a = 0; return 0;
     case 0x125E: /*BLKROGET*/ *(int*)a = 0; return 0;
-    case 0x125F: /*BLKRRPART — truly re-read the disk: the inode table may
-                    have moved (external writers append new blocks), so
-                    reopen the container and swap in a fresh handle */
+    case 0x125F: /*BLKRRPART — drop the parsed partition cache and re-read it
+                    from the device on next use.  This used to reopen the
+                    container to pick up an external writer's appended
+                    blocks, but a container now takes one writer at a time
+                    (see cfs_lock), so no external writer can exist and the
+                    in-memory table is already current.  The reopen had also
+                    become self-defeating: flock conflicts between two
+                    descriptors in the same process, so the hook locked
+                    itself out of its own container. */
         if (bf->part != 0) { errno = EINVAL; return -1; }
-        {
-            CFS *nc = cfs_open(blk_file, CFS_RDWR | CFS_RAW);
-            if (!nc) { errno = EIO; return -1; }
-            CFS *old = blk_cfs;
-            blk_cfs = nc;
-            if (old) cfs_close(old);
-            _DBG("  BLKRRPART: reopened %s", blk_file);
-            return 0;
-        }
+        cfs_part_invalidate(blk_cfs);
+        _DBG("  BLKRRPART: partition cache dropped");
+        return 0;
     case 0x1261: /*BLKFLSBUF*/ return 0;
     case 0x1277: /*BLKDISCARD — arg is uint64_t range[2] (start, len) bytes;
                     discarded data must read back as zeros */

@@ -33,10 +33,19 @@ P1=$(./test/vblk_probe /dev/vda1 read 2048 16)
 DISK=$(./test/vblk_probe /dev/vda read 1050624 16)
 ck "$P1" "$DISK" "part1 data == disk bytes at 1MB+2048"
 
-echo "[h2] stale cache + BLKRRPART re-read"
-( sleep 0.3; env -u LD_PRELOAD ./cfs-tool partadd "$T/d.cfs" linux 98304 114687 >/dev/null 2>&1 ) &
-ck "$(./test/vblk_probe /dev/vda stalecheck 3 /dev/vda3)" "stale:8388608" "stale cache invisible, BLKRRPART reveals vda3"
+echo "[h2] the container takes one writer at a time"
+# This used to have a background cfs-tool partadd change the container while
+# the device was open, and check that the hook's cached partition table went
+# stale until BLKRRPART.  That scenario is now impossible by design: a
+# container takes an advisory lock, so a second writer is refused outright
+# rather than allowed to corrupt a table another handle is mid-way through.
+# The guarantee is the refusal, so that is what gets checked.
+( sleep 0.3; env -u LD_PRELOAD ./cfs-tool partadd "$T/d.cfs" linux 98304 114687 >/dev/null 2>&1; \
+  echo $? > "$T/ext.rc" ) &
+ck "$(./test/vblk_probe /dev/vda stalecheck 3 /dev/vda3)" "still-fail" "external writer refused while the device is open"
 wait
+ck "$([ "$(cat "$T/ext.rc" 2>/dev/null)" != "0" ] && echo refused || echo allowed)" \
+   "refused" "cfs-tool partadd exits non-zero against an open container"
 
 echo "[h3] sector size"
 ck "$(CFS_SECTOR_SIZE=4096 ./test/vblk_probe /dev/vda ssz)" "4096" "ssz 4096"

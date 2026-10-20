@@ -109,7 +109,15 @@ uint64_t cfs_physical_used(CFS *cfs);   /* bytes the container file occupies */
 
 /* ─── Block Device Layer ───────────────────────────────────── */
 ssize_t cfs_block_read(CFS *cfs, void *buf, size_t size, off_t offset);
+/* All-or-nothing: 0 on success, non-zero if any part was refused. */
 int     cfs_block_write(CFS *cfs, const void *buf, size_t size, off_t offset);
+/* Short-write form, like write(2): returns the number of bytes that landed,
+ * or -1 if none did.  A device write is cut at 8MB boundaries, so a range
+ * that runs into the end of the device — or into the physical quota — can
+ * land its early part and refuse the rest; callers that face a guest should
+ * use this one and report the short count rather than failing the whole
+ * write. */
+ssize_t cfs_block_write_some(CFS *cfs, const void *buf, size_t size, off_t offset);
 uint64_t cfs_block_size(CFS *cfs);
 int     cfs_block_resize(CFS *cfs, uint64_t size);
 

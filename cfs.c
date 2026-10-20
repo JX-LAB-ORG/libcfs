@@ -10,6 +10,7 @@
 #include <errno.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/file.h>
 
 static inline uint16_t rd16(const uint8_t *p) { return (uint16_t)p[0]|((uint16_t)p[1]<<8); }
 static inline uint32_t rd32(const uint8_t *p) { return (uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24); }
@@ -43,6 +44,7 @@ static int dedup_pend_ready(CFS *c);
 static int dedup_pend_flush(CFS *c);
 static int dedup_table_flush(CFS *c);
 static int dedup_emit(CFS *c, const uint8_t *p, size_t n, uint64_t *out_off);
+static int cfs_lock(CFS *c);
 
 /* ── Container-file writes: two kinds, one of them quota-guarded ──
  * Data blocks grow the file and answer to the physical quota.  Metadata (the
@@ -168,7 +170,13 @@ CFS *cfs_create(const char *path) {
     CFS *c = calloc(1, sizeof(*c)); if(!c)return NULL;
     c->fd = open(path, O_RDWR|O_CREAT|O_TRUNC, 0644);
     if(c->fd < 0) { free(c); return NULL; }
+    c->cpath = strdup(path);
+    if (!c->cpath) { close(c->fd); free(c); return NULL; }
     c->flags = CFS_RDWR;
+    /* O_TRUNC has already cut the file down, so this is the last chance to
+     * notice that someone else was using it — without the lock, "create"
+     * silently destroys a container another handle is writing. */
+    if (cfs_lock(c) != 0) { errno = EBUSY; close(c->fd); free(c); return NULL; }
     c->part_kind = -1;   /* partition cache starts unparsed */
     memcpy(c->sb.magic, CFS_MAGIC, 8);
     c->sb.version = CFS_VERSION;
@@ -232,6 +240,27 @@ int cfs_finalise(CFS *c) {
 }
 
 /* ── Open ─────────────────────────────────────────────────── */
+/* ── One writer at a time ────────────────────────────────────────
+ * A sync updates the data blocks, then the inode table, then the superblock,
+ * in several passes; a second writer interleaving with that, or a reader
+ * walking in between two of the passes, sees a table pointing at bytes that
+ * are not there yet.  Nothing in the format prevents it, so the container
+ * takes an advisory lock: writers exclusive, readers shared.  flock rather
+ * than fcntl because it conflicts between two file descriptors even inside
+ * one process, which is where a second handle would otherwise slip through.
+ *
+ * CFS_NO_LOCK=1 skips it, for reading a container whose writer is known to
+ * be idle (inspection, recovery).  It does not make concurrent writing
+ * safe — it only removes the seatbelt. */
+static int cfs_lock(CFS *c) {
+    const char *off = getenv("CFS_NO_LOCK");
+    if (off && *off && *off != '0') return 0;
+    if (flock(c->fd, ((c->flags & CFS_RDWR) ? LOCK_EX : LOCK_SH) | LOCK_NB) != 0)
+        return -1;
+    c->locked = 1;
+    return 0;
+}
+
 CFS *cfs_open(const char *path, int flags) {
     int oflags = (flags & CFS_RDWR) ? O_RDWR : O_RDONLY;
     CFS *c = calloc(1, sizeof(*c)); if (!c) return NULL;
@@ -239,6 +268,11 @@ CFS *cfs_open(const char *path, int flags) {
     c->flags = flags & (CFS_RDONLY | CFS_RDWR);
     c->fd = open(path, oflags);
     if (c->fd < 0) { free(c); return NULL; }
+    c->cpath = strdup(path);
+    if (!c->cpath) { close(c->fd); free(c); return NULL; }
+    /* Lock before reading anything: a table read while another handle is
+     * halfway through a sync is exactly the torn state this prevents. */
+    if (cfs_lock(c) != 0) { errno = EBUSY; close(c->fd); free(c); return NULL; }
     /* Host policy, not container content: the physical quota is set by
      * whoever opens the container (the hook and the CLI both honour
      * CFS_MAX_PHYSICAL), so it never has to live in the format. */
@@ -315,12 +349,14 @@ fail:
 void cfs_close(CFS *c) {
     if (!c) return;
     if ((c->flags & CFS_RDWR) && (c->pend_n || c->dt_dirty)) cfs_sync(c);
+    if (c->locked) flock(c->fd, LOCK_UN);   /* close would drop it anyway */
     if (c->fd >= 0) close(c->fd);
     dedup_cache_drop(c);
     free(c->pend_buf);
     if (c->fi_ready) cfs_feat_index_free(&c->fi);
     for (uint32_t i = 0; i < c->inode_count; i++) { free(c->inodes[i].path); free(c->inodes[i].raw.blocks); }
     free(c->inodes);
+    free(c->cpath);
     free(c);
 }
 
@@ -832,10 +868,23 @@ int cfs_chown(CFS *c, const char *path, uint32_t uid, uint32_t gid) {
 int cfs_compact(CFS *c) {
     if (!c || !(c->flags & CFS_RDWR)) return -1;
 
-    /* Build a temporary path */
-    char tmp[1024];
-    int flen = snprintf(tmp, sizeof(tmp), "/tmp/cfs_compact_XXXXXX");
-    (void)flen;
+    /* The rebuilt copy and the container are both on disk while this runs,
+     * so compact needs transient double space.  Refuse up front rather than
+     * filling the host — a container sitting at its quota has no room for
+     * its own replacement. */
+    if (c->phys_limit && cfs_physical_used(c) > c->phys_limit / 2) {
+        errno = ENOSPC;
+        return CFS_ENOSPC;
+    }
+
+    /* The scratch file has to sit NEXT TO the container: rename() is only
+     * atomic within one filesystem, and /tmp is a different one on most
+     * systems — where this used to either fail with EXDEV at the very end,
+     * after copying everything, or try to hold the whole container in a
+     * RAM-backed tmpfs. */
+    char tmp[4096];
+    if (strlen(c->cpath) + 12 >= sizeof(tmp)) return -1;
+    snprintf(tmp, sizeof(tmp), "%s.cmpXXXXXX", c->cpath);
     int tfd = mkstemp(tmp);
     if (tfd < 0) return -1;
 
@@ -1195,7 +1244,33 @@ static int block_write_fallback(CFS *c, const uint8_t *buf, size_t size,
 #define BLOCK_CHUNK (8u << 20)   /* 8MB compression unit: bounds RMW cost */
 #define PEND_MAX 128              /* pending-patch slots per write (<=2 touched) */
 
+/* Short-write form: cut the request at 8MB boundaries and stop at the first
+ * piece that is refused, reporting how far it got.  The pieces never
+ * straddle a boundary, so the split inside the implementation never fires
+ * from here — and calling it directly (rather than the public wrapper) is
+ * what keeps the two from recursing through each other. */
+static int cfs_block_write_impl(CFS *c, const void *buf, size_t size, off_t offset);
+
+ssize_t cfs_block_write_some(CFS *c, const void *buf, size_t size, off_t offset) {
+    if (!c || !buf || size == 0 || offset < 0) return -1;
+    size_t done = 0;
+    while (done < size) {
+        uint64_t off = (uint64_t)offset + done;
+        uint64_t ce = (off / BLOCK_CHUNK + 1) * BLOCK_CHUNK;
+        size_t part = (size_t)(ce - off);
+        if (part > size - done) part = size - done;
+        if (cfs_block_write_impl(c, (const uint8_t *)buf + done, part, (off_t)off) != 0)
+            return done ? (ssize_t)done : -1;
+        done += part;
+    }
+    return (ssize_t)done;
+}
+
 int cfs_block_write(CFS *c, const void *buf, size_t size, off_t offset) {
+    return cfs_block_write_some(c, buf, size, offset) == (ssize_t)size ? 0 : -1;
+}
+
+static int cfs_block_write_impl(CFS *c, const void *buf, size_t size, off_t offset) {
     if(!c||!buf||size==0) return -1;
     if(offset<0) return -1;
     if(!(c->flags & CFS_RDWR)) return -1;

@@ -15,6 +15,7 @@ typedef struct { char *path; CfsInode raw; } InodeEntry;
 struct CFS {
     int           fd;
     int           flags;
+    char         *cpath;      /* the container's own path, for scratch files */
     CfsSuperBlock sb;
     CfsStats      st;
     InodeEntry   *inodes;
@@ -52,6 +53,10 @@ struct CFS {
      * deliberately independent — and only the second one protects the host
      * when a small archive carries a lot of *unique* data. */
     uint64_t      phys_limit;
+
+    /* Set when this handle holds the container's advisory lock (see
+     * cfs_lock in cfs.c).  Released on close. */
+    int           locked;
 };
 
 #endif /* CFS_INTERNAL_H */
