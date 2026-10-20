@@ -259,6 +259,95 @@ static void test_disk_identity(void) {
     unlink(PATH);
 }
 
+/* ── Test 8: the declared size is a hard capacity, not a high-water mark ──
+ * Both halves matter for the guest-container case: a container is the blast
+ * radius for whatever runs inside it, which only holds if a guest cannot
+ * push it past the size it was created with — and if merely reading it
+ * cannot either. */
+static void test_capacity_is_a_limit(void) {
+    printf("[t8] declared size is a hard capacity\n");
+    unlink(PATH);
+    CFS *c = cfs_create(PATH);
+    CHK(c != NULL, "cap: create");
+    if (!c) return;
+    CHK(cfs_block_resize(c, DISK_SZ) == 0, "cap: resize 128MB");
+
+    uint8_t d[8192], r[8192];
+    memset(d, 0xAB, sizeof(d));
+
+    /* a read past the end returns zeros and leaves the device alone */
+    CHK(cfs_block_read(c, r, 4096, (off_t)(DISK_SZ + 64ULL*1024*1024)) == 4096,
+        "cap: read past the end returns zeros");
+    CHK(cfs_block_size(c) == DISK_SZ, "cap: read did not resize the device");
+
+    /* data written at the start, to be checked after a refused write */
+    CHK(cfs_block_write(c, d, 4096, 0) == 0, "cap: write 4K @0");
+
+    /* past the end, exactly at it, and straddling it: all refused */
+    CHK(cfs_block_write(c, d, 4096, (off_t)DISK_SZ) != 0, "cap: write past the end fails");
+    CHK(cfs_block_write(c, d, 4096, (off_t)(DISK_SZ - 2048)) != 0, "cap: write straddling the end fails");
+    CHK(cfs_block_write(c, d, 4096, (off_t)(DISK_SZ + 1)) != 0, "cap: write beyond the end fails");
+    CHK(cfs_block_size(c) == DISK_SZ, "cap: device size unchanged by refused writes");
+
+    /* the last byte is writable, and nothing before it was disturbed */
+    CHK(cfs_block_write(c, d, 1, (off_t)(DISK_SZ - 1)) == 0, "cap: write the last byte");
+    CHK(cfs_block_read(c, r, 4096, 0) == 4096 && r[0] == 0xAB && r[4095] == 0xAB,
+        "cap: earlier data survives a refused write");
+
+    /* and it is persistent: a reopen still sees the same capacity */
+    cfs_close(c);
+    c = cfs_open(PATH, CFS_RDWR);
+    CHK(c != NULL && cfs_block_size(c) == DISK_SZ, "cap: capacity persists across reopen");
+    if (c) cfs_close(c);
+    unlink(PATH);
+}
+
+/* ── Test 9: the physical quota bounds the host file ──
+ * The declared size says how big the container looks from the inside; the
+ * quota says how much host space it may take.  They are independent on
+ * purpose: a repetitive archive expands to terabytes inside while costing
+ * almost nothing outside.  This is the backstop for the other kind — a small
+ * archive that carries a lot of unique data — so it is exercised with
+ * incompressible bytes, which grow the file roughly one for one. */
+static void test_physical_quota(void) {
+    printf("[t9] physical quota bounds the host file\n");
+    unlink(PATH);
+    CFS *c = cfs_create(PATH);
+    CHK(c != NULL, "quota: create");
+    if (!c) return;
+    CHK(cfs_block_resize(c, 64ULL*1024*1024) == 0, "quota: declare 64MB");
+    CHK(cfs_set_physical_limit(c, 2ULL*1024*1024) == 0, "quota: set 2MB");
+    CHK(cfs_physical_limit(c) == 2ULL*1024*1024, "quota: reports 2MB");
+
+    const size_t MB = 1u << 20;
+    uint8_t *buf = malloc(MB);
+    uint64_t s = 0x243F6A8885A308D3ull;
+    for (size_t i = 0; i < MB; i++) { s ^= s << 13; s ^= s >> 7; s ^= s << 17; buf[i] = (uint8_t)(s >> 33); }
+
+    int refused = 0;
+    uint64_t off = 0, accepted = 0;
+    for (; off < 64ULL*1024*1024; off += MB) {
+        if (cfs_block_write(c, buf, MB, (off_t)off) != 0) { refused = 1; break; }
+        accepted++;
+    }
+    CHK(refused, "quota: a write is eventually refused");
+    CHK(accepted > 0, "quota: writes are accepted until the quota is reached");
+    CHK(cfs_physical_used(c) <= 2ULL*1024*1024, "quota: host file stayed within the limit");
+    CHK(cfs_block_size(c) == 64ULL*1024*1024, "quota: declared size unaffected by the quota");
+
+    /* what was accepted before the refusal is intact, and persists */
+    uint8_t *r = malloc(MB);
+    CHK(cfs_block_read(c, r, MB, 0) == (ssize_t)MB && r[0] == buf[0] && r[MB-1] == buf[MB-1],
+        "quota: accepted data reads back");
+    cfs_close(c);
+    c = cfs_open(PATH, CFS_RDWR);
+    CHK(c != NULL && cfs_block_read(c, r, MB, 0) == (ssize_t)MB && r[0] == buf[0],
+        "quota: accepted data survives reopen");
+    if (c) cfs_close(c);
+    free(buf); free(r);
+    unlink(PATH);
+}
+
 int main(void) {
     test_cpenc_diag();
     test_shrink_regression();
@@ -268,6 +357,8 @@ int main(void) {
     test_out_of_order_holes();
     test_raw_mode();
     test_disk_identity();
+    test_capacity_is_a_limit();
+    test_physical_quota();
     printf("\n=== %d failures ===\n", failed);
     return failed ? 1 : 0;
 }

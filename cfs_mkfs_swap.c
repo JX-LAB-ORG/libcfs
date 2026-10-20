@@ -20,6 +20,9 @@ int cfs_mkfs_swap(CFS *c, uint64_t disk_sz) {
 
 int cfs_mkfs_swap_at(CFS *c, uint64_t base_off, uint64_t size) {
     if (!c || size < SWAP_MIN_SIZE || base_off % SWAP_PAGE_SIZE) return -1;
+    /* Capacity first: cfs_block_write refuses anything past the declared
+     * size, so the formatter must declare it before it writes. */
+    if (cfs_block_resize(c, base_off + size) != 0) return -1;
 
     /* Linux swap_header_v1 layout inside page 0:
      *   bootbits[1024] | version(1) @1024 | last_page @1028 |
@@ -33,6 +36,5 @@ int cfs_mkfs_swap_at(CFS *c, uint64_t base_off, uint64_t size) {
     memcpy(page + SWAP_PAGE_SIZE - SWAP_MAGIC_LEN, SWAP_MAGIC, SWAP_MAGIC_LEN);
 
     if (cfs_block_write(c, page, SWAP_PAGE_SIZE, (off_t)base_off) != 0) return -1;
-    cfs_block_resize(c, base_off + size);
     return 0;
 }

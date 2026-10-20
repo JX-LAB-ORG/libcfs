@@ -44,6 +44,11 @@ int cfs_mkfs_ext4_at(CFS *c, uint64_t base_off, uint64_t size) {
     const uint32_t bs = 4096;
     uint32_t bc = (uint32_t)(size / bs);
     if (bc < 64) return -1;
+    /* Establish the capacity BEFORE the first write.  The declared size is a
+     * hard limit (cfs_block_write refuses anything past it), so a formatter
+     * that wrote first and resized at the end would have every write
+     * refused — the CLI path only worked because cfs-tool resized for it. */
+    if (cfs_block_resize(c, base_off + size) != 0) return -1;
     /* A block group holds at most 8 x block_size blocks (32768 with 4K
      * blocks).  Cramming a larger filesystem into one group is what made
      * e2fsck call the superblock corrupt, so past that we lay out real
@@ -217,7 +222,5 @@ int cfs_mkfs_ext4_at(CFS *c, uint64_t base_off, uint64_t size) {
     free(gb);
     free(img);
 
-    /* Ensure @block covers the partition end (grow-only) */
-    cfs_block_resize(c, base_off + size);
-    return 0;
+    return 0;   /* the capacity was set before the first write */
 }

@@ -61,6 +61,9 @@ int cfs_mkfs_fat32(CFS *c, uint64_t disk_sz) {
 int cfs_mkfs_fat32_at(CFS *c, uint64_t base_off, uint64_t size) {
     if (!c || size < FAT_MIN_SIZE) return -1;
     if (base_off % FAT_SECTOR) return -1;
+    /* Capacity first: cfs_block_write refuses anything past the declared
+     * size, so the formatter must declare it before it writes. */
+    if (cfs_block_resize(c, base_off + size) != 0) return -1;
 
     /* Sector-to-cluster sizing (mkfs.fat style table) */
     uint32_t spc;   /* sectors per cluster */
@@ -158,7 +161,6 @@ int cfs_mkfs_fat32_at(CFS *c, uint64_t base_off, uint64_t size) {
     free(fat);
     if (rc != 0) return -1;
 
-    cfs_block_resize(c, base_off + size);
     fprintf(stderr, "cfs: fat32: %llu clusters, %u/sector, fat=%u sectors, free=%llu\n",
             (unsigned long long)clusters, spc, fat_sz, (unsigned long long)free_c);
     return 0;

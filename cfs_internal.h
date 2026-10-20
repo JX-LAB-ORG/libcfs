@@ -43,6 +43,15 @@ struct CFS {
     uint8_t      *pend_buf;
     size_t        pend_n, pend_cap;
     uint64_t      pend_off;
+
+    /* Physical quota: the most this container's file may occupy on the host,
+     * in bytes (0 = unlimited).  The declared device size says how big the
+     * container looks from the inside; this says how much host space the
+     * host is willing to give it.  A repetitive archive can expand to
+     * terabytes inside while costing almost nothing outside, so the two are
+     * deliberately independent — and only the second one protects the host
+     * when a small archive carries a lot of *unique* data. */
+    uint64_t      phys_limit;
 };
 
 #endif /* CFS_INTERNAL_H */

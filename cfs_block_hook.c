@@ -26,6 +26,7 @@
 #define CFS_RDONLY 0x01
 #define CFS_RDWR   0x02
 #define CFS_RAW    0x08   /* store data uncompressed */
+#define CFS_ENOSPC (-28)  /* mirrors cfs.h: write past the device capacity */
 struct _cfs; typedef struct _cfs CFS;
 typedef struct {
     int      index;
@@ -243,11 +244,18 @@ ssize_t pread64(int fd, void *b, size_t n, off_t o) { return pread(fd, b, n, o);
 /* ═══════════════════════════════════════════════════════════════
    write / pwrite
    ═══════════════════════════════════════════════════════════════ */
+/* A write past the device capacity — or past the container's physical quota
+ * — is a full disk, not an I/O error.  The return code is the direct signal;
+ * errno is the backstop for the paths that collapse it into -1 (the dedup
+ * append does, and it sets errno on the way out). */
+static void blk_wfail(int rc) { errno = (rc == CFS_ENOSPC || errno == ENOSPC) ? ENOSPC : EIO; }
+
 ssize_t write(int fd, const void *buf, size_t n) {
     BlkFd *bf = blk_fd_get(fd);
     if (!bf) { LOAD(_w, "write"); return _w(fd, buf, n); }
     _DBG("WRITE fd=%d n=%zu off=%lld", fd, n, (long long)bf->pos);
-    if (cfs_block_write(blk_cfs, buf, n, (off_t)(bf->pstart + (uint64_t)bf->pos)) != 0) return -1;
+    int rc = cfs_block_write(blk_cfs, buf, n, (off_t)(bf->pstart + (uint64_t)bf->pos));
+    if (rc != 0) { blk_wfail(rc); return -1; }
     bf->pos += (off_t)n;
     return (ssize_t)n;
 }
@@ -255,7 +263,8 @@ ssize_t pwrite(int fd, const void *buf, size_t n, off_t off) {
     BlkFd *bf = blk_fd_get(fd);
     if (!bf) { static ssize_t (*_pw)(int,const void*,size_t,off_t); LOAD(_pw, "pwrite"); return _pw(fd, buf, n, off); }
     _DBG("PWRITE fd=%d off=%lld n=%zu", fd, (long long)off, n);
-    if (cfs_block_write(blk_cfs, buf, n, (off_t)(bf->pstart + (uint64_t)off)) != 0) return -1;
+    int rc = cfs_block_write(blk_cfs, buf, n, (off_t)(bf->pstart + (uint64_t)off));
+    if (rc != 0) { blk_wfail(rc); return -1; }
     return (ssize_t)n;
 }
 ssize_t pwrite64(int fd, const void *b, size_t n, off_t o) { return pwrite(fd, b, n, o); }

@@ -1,10 +1,12 @@
 /* vblk_probe — probe the virtual block device (run under cfs_block_hook.so)
  * usage: vblk_probe <dev> size64|ssz|getsize|rdev|rrpart
- *        vblk_probe <dev> read <off> <len>     (hex bytes) */
+ *        vblk_probe <dev> read <off> <len>     (hex bytes)
+ *        vblk_probe <dev> write <off> <len>    (ok | fail:<errno>) */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <errno.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <sys/sysmacros.h>
@@ -55,6 +57,30 @@ int main(int argc, char **argv) {
         if (n != (ssize_t)len) { printf("read-fail:%zd\n", n); return 0; }
         for (size_t i = 0; i < len; i++) printf("%02x", b[i]);
         printf("\n");
+        return 0;
+    }
+    if ((!strcmp(cmd, "write") || !strcmp(cmd, "writerand")) && argc >= 5) {
+        unsigned long off = strtoul(argv[3], 0, 0);
+        unsigned long len = strtoul(argv[4], 0, 0);
+        int fd = open(dev, O_RDWR);
+        if (fd < 0) { printf("open-fail\n"); return 0; }
+        uint8_t *b = malloc(len);
+        if (!b) { printf("alloc-fail\n"); return 0; }
+        if (!strcmp(cmd, "write")) {
+            memset(b, 0xA5, len);            /* compressible: capacity tests */
+        } else {
+            uint64_t s = 0x9E3779B97F4A7C15ull;   /* incompressible: quota tests */
+            for (unsigned long i = 0; i < len; i++) {
+                s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+                b[i] = (uint8_t)(s >> 33);
+            }
+        }
+        ssize_t n = pwrite(fd, b, len, (off_t)off);
+        free(b);
+        if (n == (ssize_t)len) { printf("ok\n"); return 0; }
+        const char *nm = errno == ENOSPC ? "ENOSPC" : errno == EIO ? "EIO"
+                       : errno == EINVAL ? "EINVAL" : "other";
+        printf("fail:%s:%d\n", nm, errno);
         return 0;
     }
     if (!strcmp(cmd, "geo") || !strcmp(cmd, "ident") || !strcmp(cmd, "iomin") ||

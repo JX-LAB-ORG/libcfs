@@ -66,6 +66,46 @@ ck "$AFTER" "0000000000000000" "discarded range reads zero"
 ./test/vblk_probe /dev/vda discard 1048576 4096 >/dev/null
 ck "$(./test/vblk_probe /dev/vda read 1048576 4)" "00000000" "whole-disk discard zeroes"
 
+echo "[h3] the declared size is a hard capacity"
+# A guest must not be able to push the container past the size it was created
+# with, and a full container has to look like a full disk (ENOSPC), not like
+# an I/O error.  Writes land past both partitions, so the table is untouched.
+ck "$(./test/vblk_probe /dev/vda write 67108352 512)" "ok" "write the last sector"
+ck "$(./test/vblk_probe /dev/vda write 67108864 512)" "fail:ENOSPC:28" "write at the end -> ENOSPC"
+ck "$(./test/vblk_probe /dev/vda write 67108608 512)" "fail:ENOSPC:28" "write straddling the end -> ENOSPC"
+ck "$(./test/vblk_probe /dev/vda write 100663296 512)" "fail:ENOSPC:28" "write far past the end -> ENOSPC"
+ck "$(./test/vblk_probe /dev/vda size64)" "67108864" "capacity unchanged by refused writes"
+ck "$(./test/vblk_probe /dev/vda read 67108352 2)" "a5a5" "the last sector survived"
+
+echo "[h4] the physical quota bounds the host file"
+# The declared size says how big the container looks from the inside; the
+# quota says how much host space it may take.  The quota is set through the
+# environment (the hook only ever calls cfs_open), so this also covers that
+# path.  The writes are incompressible on purpose: compressible bytes would
+# never make the file grow, and the test would pass without testing anything.
+Q="$T/q.cfs"
+./cfs-tool mkfs ext4 64M "$Q" -p 1 >/dev/null 2>&1 || { echo "FAIL mkfs q"; exit 1; }
+base=$(stat -c %s "$Q")
+LIMIT=$((base + 2097152))
+export LD_PRELOAD="$PWD/cfs_block_hook.so"
+export CFS_BLOCK_DEV=/dev/vda CFS_BLOCK_FILE="$Q" CFS_BLOCK_PARTS=1
+export CFS_MAX_PHYSICAL=$LIMIT
+ok=0; i=0
+while [ $i -lt 200 ]; do
+    if ./test/vblk_probe /dev/vda writerand $((i * 262144)) 262144 | grep -q '^ok$'; then
+        ok=$((ok + 1)); i=$((i + 1))
+    else
+        break
+    fi
+done
+after=$(stat -c %s "$Q")
+ck "$([ "$ok" -gt 0 ] && echo yes || echo no)" "yes" "the quota still lets writes through"
+ck "$([ $((ok * 262144)) -lt 67108864 ] && echo quota-first || echo capacity-first)" \
+   "quota-first" "the quota refused before the 64MB capacity"
+ck "$([ "$after" -le "$LIMIT" ] && echo within || echo over)" "within" \
+   "host file stayed within the quota ($after <= $LIMIT)"
+unset CFS_MAX_PHYSICAL
+
 unset LD_PRELOAD
 echo ""
 echo "=== hook test: $PASS ok, $FAIL failed ==="

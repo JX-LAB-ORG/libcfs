@@ -44,6 +44,37 @@ static int dedup_pend_flush(CFS *c);
 static int dedup_table_flush(CFS *c);
 static int dedup_emit(CFS *c, const uint8_t *p, size_t n, uint64_t *out_off);
 
+/* ── Container-file writes: two kinds, one of them quota-guarded ──
+ * Data blocks grow the file and answer to the physical quota.  Metadata (the
+ * inode table and the superblock) must always land: refusing those would not
+ * leave a full container, it would leave a corrupt one, and the data blocks
+ * they describe are already on disk by then.  Every write to the container
+ * file goes through one of these two, so there is a single place to audit. */
+static int cfs_phys_room(CFS *c, off_t off, size_t n) {
+    if (!c->phys_limit) return 0;                     /* unlimited */
+    off_t end = lseek(c->fd, 0, SEEK_END);
+    uint64_t proj = (uint64_t)off + (uint64_t)n;
+    /* An in-place rewrite of an existing block may not extend the file, so
+     * the projection is the file's own end when that is further out. */
+    if (end > 0 && (uint64_t)end > proj) proj = (uint64_t)end;
+    /* The inode table and the superblock are written past the data and are
+     * never refused, so keep room for them — otherwise a container sitting
+     * exactly at its quota would still grow by the table on the next sync. */
+    proj += (uint64_t)c->sb.inode_size + CFS_SB_SIZE;
+    if (proj > c->phys_limit) { errno = ENOSPC; return CFS_ENOSPC; }
+    return 0;
+}
+
+static ssize_t cfs_pw(CFS *c, const void *b, size_t n, off_t off) {
+    int rc = cfs_phys_room(c, off, n);
+    if (rc) { errno = ENOSPC; return -1; }
+    return pwrite(c->fd, b, n, off);
+}
+
+static ssize_t cfs_pw_meta(CFS *c, const void *b, size_t n, off_t off) {
+    return pwrite(c->fd, b, n, off);
+}
+
 /* ── Write superblock + inode table to disk ────────────────────── */
 static int cfs_sync(CFS *c) {
     volatile uint64_t canary_a = 0xCAFEBABECAFEBABEULL;
@@ -109,7 +140,7 @@ static int cfs_sync(CFS *c) {
     uint64_t hi = c->sb.inode_offset + c->sb.inode_size;
     uint64_t io = data_end > hi ? data_end : hi;
     off_t io_off = (off_t)io;
-    if (pwrite(c->fd, tab, c->sb.inode_size, io_off) != (ssize_t)c->sb.inode_size) {
+    if (cfs_pw_meta(c, tab, c->sb.inode_size, io_off) != (ssize_t)c->sb.inode_size) {
         free(tab); return -1;
     }
     c->sb.inode_offset = (uint64_t)io_off;
@@ -125,7 +156,7 @@ static int cfs_sync(CFS *c) {
     wr32(sb + 22, c->sb.file_count);
     wr64(sb + 26, c->sb.created_at);
     wr16(sb + 34, c->sb.flags);
-    if (pwrite(c->fd, sb, CFS_SB_SIZE, 0) != CFS_SB_SIZE) return -1;
+    if (cfs_pw_meta(c, sb, CFS_SB_SIZE, 0) != CFS_SB_SIZE) return -1;
     if (fsync(c->fd) != 0) return -1;
     if (canary_a != 0xCAFEBABECAFEBABEULL || canary_b != 0xDEADBEEFDEADBEEFULL)
         write(2, "CANARY CORRUPT in cfs_sync\n", 27);
@@ -178,7 +209,7 @@ int cfs_add_file(CFS *c, const char *vpath, const void *buf, size_t size) {
     }
 
     off_t write_off = (off_t)c->sb.inode_offset;
-    if(pwrite(c->fd,comp,cl,write_off)!=(ssize_t)cl){free(comp);return -1;}
+    if(cfs_pw(c,comp,cl,write_off)!=(ssize_t)cl){free(comp);return -1;}
 
     InodeEntry *na=realloc(c->inodes,(c->inode_count+1)*sizeof(InodeEntry));
     if(!na){free(comp);return -1;} c->inodes=na;
@@ -208,6 +239,13 @@ CFS *cfs_open(const char *path, int flags) {
     c->flags = flags & (CFS_RDONLY | CFS_RDWR);
     c->fd = open(path, oflags);
     if (c->fd < 0) { free(c); return NULL; }
+    /* Host policy, not container content: the physical quota is set by
+     * whoever opens the container (the hook and the CLI both honour
+     * CFS_MAX_PHYSICAL), so it never has to live in the format. */
+    {
+        const char *lim = getenv("CFS_MAX_PHYSICAL");
+        if (lim && *lim) c->phys_limit = strtoull(lim, NULL, 0);
+    }
 
     uint8_t sb[CFS_SB_SIZE];
     if (pread(c->fd, sb, CFS_SB_SIZE, 0) != CFS_SB_SIZE) goto fail;
@@ -431,6 +469,18 @@ int cfs_write(CFS *c, const char *path, const void *buf, size_t size) {
         free(blks); return -1;
     }
 
+    /* Physical quota, checked for the whole batch before any in-memory state
+     * changes: a refusal here must leave the handle exactly as it was, or a
+     * later read would walk a block table whose blocks were never written. */
+    {
+        uint64_t tot = 0;
+        for (uint32_t b = 0; b < n_blocks; b++) tot += blks[b].cl;
+        if (cfs_phys_room(c, (off_t)c->sb.inode_offset, (size_t)tot)) {
+            for (uint32_t b = 0; b < n_blocks; b++) free(blks[b].data);
+            free(blks); return CFS_ENOSPC;
+        }
+    }
+
     /* Allocate or reuse inode entry */
     if (is_new) {
         InodeEntry *na = realloc(c->inodes, (c->inode_count + 1) * sizeof(InodeEntry));
@@ -462,7 +512,7 @@ int cfs_write(CFS *c, const char *path, const void *buf, size_t size) {
     /* Write blocks sequentially */
     uint64_t cur_off = c->sb.inode_offset;
     for (uint32_t b = 0; b < n_blocks; b++) {
-        if (pwrite(c->fd, blks[b].data, blks[b].cl, (off_t)cur_off) != (ssize_t)blks[b].cl) {
+        if (cfs_pw(c, blks[b].data, blks[b].cl, (off_t)cur_off) != (ssize_t)blks[b].cl) {
             ok = 0; break;
         }
         e->raw.blocks[b].offset    = cur_off;
@@ -638,7 +688,7 @@ int cfs_truncate(CFS *c, const char *path, uint64_t size) {
         free(lb);
         if (rc) { free(comp); return -1; }
         off_t wo = (off_t)e->raw.blocks[keep - 1].offset;
-        if (pwrite(c->fd, comp, cl, wo) != (ssize_t)cl) {
+        if (cfs_pw(c, comp, cl, wo) != (ssize_t)cl) {
             free(comp); return -1;
         }
         e->raw.blocks[keep - 1].comp_size = (uint32_t)cl;
@@ -680,8 +730,8 @@ int cfs_symlink(CFS *c, const char *target, const char *linkpath) {
     h->stride = CPENC_STRIDE_RAW; h->original_size = (uint32_t)tl;
     h->compressed_size = (uint32_t)(1 + tl);
     hdr[CPENC_HEADER_SIZE] = CPENC_LAG_NONE;
-    if (pwrite(c->fd, hdr, CPENC_HEADER_SIZE + 1, wo) != CPENC_HEADER_SIZE + 1 ||
-        pwrite(c->fd, target, tl, wo + CPENC_HEADER_SIZE + 1) != (ssize_t)tl)
+    if (cfs_pw(c, hdr, CPENC_HEADER_SIZE + 1, wo) != CPENC_HEADER_SIZE + 1 ||
+        cfs_pw(c, target, tl, wo + CPENC_HEADER_SIZE + 1) != (ssize_t)tl)
         { free(e->path); c->inode_count--; return -1; }
 
     e->raw.orig_size   = tl;
@@ -963,7 +1013,12 @@ static int block_ensure(CFS *c, uint64_t minsz) {
 
 ssize_t cfs_block_read(CFS *c, void *buf, size_t size, off_t offset) {
     if(!c||!buf||size==0) return -1;
-    if(block_ensure(c, (uint64_t)offset+(uint64_t)size)!=0) return -1;
+    /* Create the entry if it is missing, but never grow the device: a read
+     * must not mutate the container.  The zero-fill below already covers
+     * every unwritten byte, so the grow this used to do was pure side
+     * effect — and it meant a guest probing past the end of its disk (which
+     * is ordinary behaviour) silently resized it. */
+    if(block_ensure(c, 0)!=0) return -1;
     if(offset<0) return -1;
     InodeEntry *e = lu(c, BLOCK_PATH);
     if(!e) return -1;
@@ -1007,7 +1062,7 @@ static uint64_t block_blk_start(const InodeEntry *e, uint32_t b) {
  * locates blocks by prefix sum of orig_size, so holes cannot exist. */
 static int block_patch(CFS *c, InodeEntry *e, uint32_t b, const uint8_t *src,
                        uint64_t w0, uint64_t po, uint64_t pe, size_t ext,
-                       uint8_t *pend_data[], uint32_t pend_idx[], size_t pend_cl[], int *np) {
+                       uint8_t *pend_data[], uint32_t pend_idx[], size_t pend_cl[], size_t pend_orig[], int *np) {
     CfsBlock *blk = &e->raw.blocks[b];
     uint32_t olen = blk->orig_size;
     uint32_t nolen = olen + (uint32_t)ext;
@@ -1036,7 +1091,12 @@ static int block_patch(CFS *c, InodeEntry *e, uint32_t b, const uint8_t *src,
     if (ext)
         memcpy(dec + olen, src + (size_t)((bo + (uint64_t)olen) - w0), ext);
 
-    blk->orig_size = nolen;
+    /* orig_size is deliberately NOT set here.  The payload may end up in a
+     * pend slot written later, and the commit can still be refused (a full
+     * container) — mutating the block now would leave the handle describing
+     * a block whose bytes were never written, and the read path locates
+     * blocks by prefix sums of orig_size.  Each branch below applies it once
+     * its write has actually landed. */
     if (c->flags & CFS_RAW) {
         /* RAW payload = header + nolen; only in-place when size unchanged */
         if (ext) {
@@ -1050,7 +1110,8 @@ static int block_patch(CFS *c, InodeEntry *e, uint32_t b, const uint8_t *src,
             nc[CPENC_HEADER_SIZE] = CPENC_LAG_NONE;
             memcpy(nc + CPENC_HEADER_SIZE + 1, dec, nolen);
             free(dec);
-            pend_data[*np] = nc; pend_idx[*np] = b; pend_cl[*np] = CPENC_HEADER_SIZE + 1 + nolen; (*np)++;
+            pend_data[*np] = nc; pend_idx[*np] = b; pend_orig[*np] = nolen;
+            pend_cl[*np] = CPENC_HEADER_SIZE + 1 + nolen; (*np)++;
             return 0;
         }
         /* rewrite the payload in place (same size) */
@@ -1064,8 +1125,9 @@ static int block_patch(CFS *c, InodeEntry *e, uint32_t b, const uint8_t *src,
         nc[CPENC_HEADER_SIZE] = CPENC_LAG_NONE;
         memcpy(nc + CPENC_HEADER_SIZE + 1, dec, olen);
         free(dec);
-        if (pwrite(c->fd, nc, CPENC_HEADER_SIZE + 1 + olen, (off_t)blk->offset) != (ssize_t)(CPENC_HEADER_SIZE + 1 + olen))
+        if (cfs_pw(c, nc, CPENC_HEADER_SIZE + 1 + olen, (off_t)blk->offset) != (ssize_t)(CPENC_HEADER_SIZE + 1 + olen))
             { free(nc); return -1; }
+        blk->orig_size = nolen;
         free(nc);
         return 0;
     }
@@ -1078,11 +1140,13 @@ static int block_patch(CFS *c, InodeEntry *e, uint32_t b, const uint8_t *src,
     free(dec);
 
     if (ncl <= blk->comp_size) {
-        if (pwrite(c->fd, nc, ncl, (off_t)blk->offset) != (ssize_t)ncl) { free(nc); return -1; }
+        if (cfs_pw(c, nc, ncl, (off_t)blk->offset) != (ssize_t)ncl) { free(nc); return -1; }
         blk->comp_size = (uint32_t)ncl;
+        blk->orig_size = nolen;
         free(nc);
     } else {
-        pend_data[*np] = nc; pend_idx[*np] = b; pend_cl[*np] = ncl; (*np)++;
+        pend_data[*np] = nc; pend_idx[*np] = b; pend_orig[*np] = nolen;
+        pend_cl[*np] = ncl; (*np)++;
     }
     return 0;
 }
@@ -1135,6 +1199,18 @@ int cfs_block_write(CFS *c, const void *buf, size_t size, off_t offset) {
     if(!c||!buf||size==0) return -1;
     if(offset<0) return -1;
     if(!(c->flags & CFS_RDWR)) return -1;
+    /* The declared size is the device capacity, not a high-water mark: a
+     * write past it fails here, the way it would on a real disk.  Growing
+     * the device is explicit (cfs_block_resize), so a guest cannot push the
+     * container — and the host file behind it — past what it was created
+     * with.  Checked before the dedup branch and the chunk split so neither
+     * can route around it.  This also keeps block_ensure()'s grow path
+     * unreachable from here, and that path clears the block table. */
+    {
+        uint64_t w1 = (uint64_t)offset + (uint64_t)size;
+        if (w1 < (uint64_t)offset) { errno = ENOSPC; return CFS_ENOSPC; }   /* offset+size wrapped */
+        if (w1 > cfs_block_size(c)) { errno = ENOSPC; return CFS_ENOSPC; }
+    }
     /* A merged device takes the reference path: appends to @store instead of
      * decompressing and recompressing the 8MB chunk the write lands in. */
     {
@@ -1151,7 +1227,8 @@ int cfs_block_write(CFS *c, const void *buf, size_t size, off_t offset) {
         uint64_t chunk_end = ((uint64_t)offset / BLOCK_CHUNK + 1) * BLOCK_CHUNK;
         if (w1 > chunk_end) {
             size_t part = (size_t)(chunk_end - (uint64_t)offset);
-            if (cfs_block_write(c, buf, part, offset) != 0) return -1;
+            int rc1 = cfs_block_write(c, buf, part, offset);
+            if (rc1 != 0) return rc1;
             return cfs_block_write(c, (const uint8_t*)buf + part, size - part,
                                    (off_t)chunk_end);
         }
@@ -1208,7 +1285,8 @@ int cfs_block_write(CFS *c, const void *buf, size_t size, off_t offset) {
         uint64_t blk_limit = ((uint64_t)w0 / BLOCK_CHUNK + 1) * BLOCK_CHUNK;
         if (w1 > blk_limit) {
             size_t part = (size_t)(blk_limit - w0);
-            if (cfs_block_write(c, src, part, (off_t)w0) != 0) return -1;
+            int rc1 = cfs_block_write(c, src, part, (off_t)w0);
+            if (rc1 != 0) return rc1;
             return cfs_block_write(c, (const uint8_t*)src + part,
                                    size - part, (off_t)blk_limit);
         }
@@ -1226,7 +1304,7 @@ int cfs_block_write(CFS *c, const void *buf, size_t size, off_t offset) {
                 pend_orig[np] = size;
                 np++; nnew++;
             } else if (block_patch(c, e, nb - 1, src, w0, cur_end, cur_end, size,
-                            pend_data, pend_idx, pend_cl, &np) != 0)
+                            pend_data, pend_idx, pend_cl, pend_orig, &np) != 0)
                 goto fail_pend;
         } else {
             size_t plen = (size_t)pad;
@@ -1252,7 +1330,8 @@ int cfs_block_write(CFS *c, const void *buf, size_t size, off_t offset) {
             uint64_t blk_limit = bo + BLOCK_CHUNK;
             if (w1 > blk_limit && w0 < blk_limit) {
                 size_t part = (size_t)(blk_limit - w0);
-                if (cfs_block_write(c, src, part, (off_t)w0) != 0) return -1;
+                int rc1 = cfs_block_write(c, src, part, (off_t)w0);
+                if (rc1 != 0) return rc1;
                 return cfs_block_write(c, (const uint8_t*)src + part,
                                        size - part, (off_t)blk_limit);
             }
@@ -1265,7 +1344,7 @@ int cfs_block_write(CFS *c, const void *buf, size_t size, off_t offset) {
             if (b == nb - 1 && w1 > be) ext = (size_t)(w1 - be);
             if (po < pe || ext) {
                 if (block_patch(c, e, b, src, w0, po, pe, ext,
-                                pend_data, pend_idx, pend_cl, &np) != 0)
+                                pend_data, pend_idx, pend_cl, pend_orig, &np) != 0)
                     goto fail_pend;
             }
             if (ext) break;   /* last block absorbed the tail */
@@ -1276,6 +1355,16 @@ int cfs_block_write(CFS *c, const void *buf, size_t size, off_t offset) {
     if (nb + (uint32_t)nnew > CFS_BLOCK_SANITY) {
         for (int i = 0; i < np; i++) free(pend_data[i]);
         return block_write_fallback(c, src, size, w0, minsz, prev_sz);
+    }
+    /* Physical quota for the whole batch, before the table grows (see the
+     * note in cfs_write: a refusal must not leave a half-built table). */
+    {
+        uint64_t tot = 0;
+        for (int i = 0; i < np; i++) tot += pend_cl[i];
+        if (cfs_phys_room(c, (off_t)c->sb.inode_offset, (size_t)tot)) {
+            for (int i = 0; i < np; i++) free(pend_data[i]);
+            return CFS_ENOSPC;
+        }
     }
     if (nnew && inode_grow_blocks(e, nb + (uint32_t)nnew) != 0) {
         for (int i = 0; i < np; i++) free(pend_data[i]);
@@ -1288,7 +1377,7 @@ int cfs_block_write(CFS *c, const void *buf, size_t size, off_t offset) {
         uint64_t app = c->sb.inode_offset;
         int hi = 0;
         for (int i = 0; i < np; i++) {
-            if (pwrite(c->fd, pend_data[i], pend_cl[i], (off_t)app) != (ssize_t)pend_cl[i]) {
+            if (cfs_pw(c, pend_data[i], pend_cl[i], (off_t)app) != (ssize_t)pend_cl[i]) {
                 for (int j = i; j < np; j++) free(pend_data[j]);
                 return -1;
             }
@@ -1303,6 +1392,7 @@ int cfs_block_write(CFS *c, const void *buf, size_t size, off_t offset) {
             } else {
                 CfsBlock *blk = &e->raw.blocks[pend_idx[i]];
                 blk->offset = app; blk->comp_size = (uint32_t)pend_cl[i];
+                blk->orig_size = (uint32_t)pend_orig[i];
                 app += pend_cl[i];
             }
         }
@@ -1363,6 +1453,21 @@ int cfs_block_resize(CFS *c, uint64_t size) {
     /* Just extend the declared size — don't clear data blocks */
     if(size > e->raw.orig_size) e->raw.orig_size = size;
     return cfs_sync(c);
+}
+
+/* ── Physical quota ────────────────────────────────────────────── */
+int cfs_set_physical_limit(CFS *c, uint64_t bytes) {
+    if (!c) return -1;
+    c->phys_limit = bytes;
+    return 0;
+}
+
+uint64_t cfs_physical_limit(CFS *c) { return c ? c->phys_limit : 0; }
+
+uint64_t cfs_physical_used(CFS *c) {
+    if (!c) return 0;
+    off_t e = lseek(c->fd, 0, SEEK_END);   /* every write is a pwrite */
+    return e > 0 ? (uint64_t)e : 0;
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -1510,10 +1615,17 @@ static int store_append(CFS *c, const uint8_t *buf, size_t len, uint64_t *out_of
         ol[i] = bs;
     }
     uint32_t old = e->raw.block_count;
+    {
+        uint64_t tot = 0;
+        for (uint32_t i = 0; i < nb; i++) tot += cl[i];
+        if (cfs_phys_room(c, (off_t)c->sb.inode_offset, (size_t)tot)) {
+            free_pieces(data, cl, ol, nb, 0); return CFS_ENOSPC;
+        }
+    }
     if (inode_grow_blocks(e, old + nb) != 0) { free_pieces(data, cl, ol, nb, 0); return -1; }
     uint64_t off = c->sb.inode_offset;
     for (uint32_t i = 0; i < nb; i++) {
-        if (pwrite(c->fd, data[i], cl[i], (off_t)off) != (ssize_t)cl[i]) {
+        if (cfs_pw(c, data[i], cl[i], (off_t)off) != (ssize_t)cl[i]) {
             free_pieces(data, cl, ol, nb, i); return -1;
         }
         e->raw.blocks[old + i].offset    = off;
@@ -1554,11 +1666,18 @@ static int dedup_write_table(CFS *c, InodeEntry *e, const CfsDedupTable *t) {
         ol[i] = bs;
     }
     free(ser);
+    {
+        uint64_t tot = 0;
+        for (uint32_t i = 0; i < nb; i++) tot += cl[i];
+        if (cfs_phys_room(c, (off_t)c->sb.inode_offset, (size_t)tot)) {
+            free_pieces(data, cl, ol, nb, 0); return CFS_ENOSPC;
+        }
+    }
     inode_clear_blocks(e);
     if (inode_grow_blocks(e, nb) != 0) { free_pieces(data, cl, ol, nb, 0); return -1; }
     uint64_t off = c->sb.inode_offset;
     for (uint32_t i = 0; i < nb; i++) {
-        if (pwrite(c->fd, data[i], cl[i], (off_t)off) != (ssize_t)cl[i]) {
+        if (cfs_pw(c, data[i], cl[i], (off_t)off) != (ssize_t)cl[i]) {
             free_pieces(data, cl, ol, nb, i); return -1;
         }
         e->raw.blocks[i].offset    = off;
@@ -2062,8 +2181,9 @@ int cfs_dedup_gc(CFS *c, CfsDedupGcStats *out) {
             uint8_t *comp = NULL; size_t cl = 0;
             if (block_hole_pack(c, buf, want, &comp, &cl) != 0) { rc = -1; break; }
             uint32_t old = te->raw.block_count;
+            if (cfs_phys_room(c, (off_t)c->sb.inode_offset, cl)) { free(comp); rc = CFS_ENOSPC; break; }
             if (inode_grow_blocks(te, old + nb) != 0) { free(comp); rc = -1; break; }
-            if (pwrite(c->fd, comp, cl, (off_t)c->sb.inode_offset) != (ssize_t)cl) {
+            if (cfs_pw(c, comp, cl, (off_t)c->sb.inode_offset) != (ssize_t)cl) {
                 free(comp); rc = -1; break;
             }
             te->raw.blocks[old].offset = c->sb.inode_offset;

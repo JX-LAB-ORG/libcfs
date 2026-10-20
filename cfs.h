@@ -14,6 +14,15 @@ extern "C" {
 #define CFS_CREATE  0x04
 #define CFS_RAW     0x08   /* store data uncompressed (RAW passthrough) */
 
+/* ─── Error codes ──────────────────────────────────────────── */
+/* cfs_block_write() returns this when the write would land past the device
+ * capacity.  The declared size is a hard limit, the way a real disk's is —
+ * growing the device is explicit (cfs_block_resize), so a guest cannot push
+ * the container, or the host file behind it, past what it was created with.
+ * Layers that surface errors to a guest map this to ENOSPC, so a full
+ * container reads as a full disk rather than as an I/O error. */
+#define CFS_ENOSPC  (-28)   /* same value as ENOSPC */
+
 /* ─── Opaque container handle ──────────────────────────────── */
 typedef struct CFS CFS;
 
@@ -83,6 +92,20 @@ int    cfs_dedup_gc(CFS *cfs, CfsDedupGcStats *out);
  * against the feature index and the misses appended to @store. */
 ssize_t cfs_dedup_write(CFS *cfs, const char *path, const void *buf,
                         size_t size, off_t offset);
+
+/* ─── Physical quota ───────────────────────────────────────────
+ * The declared device size says how big the container looks from the inside;
+ * this says how much host space it may occupy.  A repetitive archive can
+ * expand to terabytes inside while costing almost nothing outside, so the
+ * two are deliberately independent — and only this one protects the host
+ * when a small archive carries a lot of *unique* data.
+ *
+ * Enforced where data blocks are appended; metadata always lands, so a full
+ * container stays consistent instead of corrupt.  0 = unlimited.  The
+ * CFS_MAX_PHYSICAL environment variable sets it at open. */
+int      cfs_set_physical_limit(CFS *cfs, uint64_t bytes);
+uint64_t cfs_physical_limit(CFS *cfs);
+uint64_t cfs_physical_used(CFS *cfs);   /* bytes the container file occupies */
 
 /* ─── Block Device Layer ───────────────────────────────────── */
 ssize_t cfs_block_read(CFS *cfs, void *buf, size_t size, off_t offset);

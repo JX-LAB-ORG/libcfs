@@ -98,6 +98,40 @@ test: $(OBJS) $(CPENC) test/iso_mk.o test/ext2_read.o
 	cc $(CFLAGS) test/cfs_dedup_codec_test.c cfs_dedup.c -o test/cfs_dedup_codec_test
 	./test/cfs_dedup_codec_test
 
+# Container-level benchmark: sequential/random I/O, small files, compact.
+bench: test/bench_cfs test/bench_gen test/bench_tables
+	$(MAKE) -C ../libcpool bench
+
+test/bench_tables: test/bench_tables.c
+	cc $(CFLAGS) test/bench_tables.c -o test/bench_tables
+
+test/bench_gen: test/bench_gen.c
+	cc $(CFLAGS) test/bench_gen.c -o test/bench_gen
+
+# Build the corpora and run the whole survey (see test/bench_all.sh).
+corpus: test/bench_gen test/bench_tables
+	sh ./test/bench_corpus.sh
+	./test/bench_gen /root/bench/corpus 32
+	./test/bench_tables /root/bench/corpus 32
+
+bench-run: bench corpus
+	bash ./test/bench_all.sh
+
+check-bench:
+	sh -n test/bench_corpus.sh
+	bash -n test/bench_all.sh
+	bash -n test/bench_tools.sh
+	bash -n test/bench_dedup.sh
+	@echo "bench scripts: syntax ok"
+
+# Drop the corpora and scratch the benchmark run leaves behind.
+clean-bench:
+	rm -rf /root/bench/corpus /root/bench/plain.bin /root/bench/bench.cfs
+	rm -rf /tmp/benchtools.* /tmp/benchdedup.*
+
+test/bench_cfs: test/bench_cfs.c cfs.o cfs_dedup.o $(CPENC)
+	cc $(CFLAGS) test/bench_cfs.c cfs.o cfs_dedup.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o test/bench_cfs
+
 # Deep stress tests (random writes, block-cap fallback, part loops).  The
 # "flaky under PRoot" note that used to live here was a bug in the test
 # itself (a 512-byte buffer written 1024 bytes wide), now fixed.
@@ -123,3 +157,4 @@ clean:
 	rm -f test/iso_mk.o test/ext2_read.o test/vblk_probe test/iso_gen
 	rm -f test/cfs_test test/cfs_rw_test test/cfs_dir_test test/cfs_new_test test/cfs_compact_test test/cfs_block_test test/cfs_part_test test/cfs_stress_test test/vblk_probe
 	rm -f test/cfs_dedup_test test/cfs_dedup_write_test test/cfs_dedup_codec_test
+	rm -f test/bench_cfs
