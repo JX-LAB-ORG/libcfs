@@ -19,3 +19,5 @@ test/cfs_dedup_codec_test
 test/cfs_dedup_write_test
 test/iso_gen
 .mountwork
+test/fuzz_cfs
+test/fuzz_cpenc

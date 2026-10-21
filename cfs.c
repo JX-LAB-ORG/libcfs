@@ -297,6 +297,20 @@ CFS *cfs_open(const char *path, int flags) {
      * regardless of the caller's open flags */
     if (c->sb.flags & CFS_SB_FLAG_RAW) c->flags |= CFS_RAW;
     c->st.file_count   = 0;   /* counted below, user files only */
+    /* The table's position and size come from the superblock, so neither is
+     * trusted: inode_size is a u32 (up to 4GB) and file_count a u32 that
+     * would be multiplied by sizeof(InodeEntry).  A crafted container kills
+     * the process allocating them before any parser sees the contents —
+     * fuzzing the container parser found exactly that, as an out-of-memory
+     * far from any crash inside cfs.  The table has to fit in the file, and
+     * the entry count has to fit in the table. */
+    {
+        off_t fsz = lseek(c->fd, 0, SEEK_END);
+        if (fsz < 0 || (uint64_t)c->sb.inode_offset + (uint64_t)c->sb.inode_size > (uint64_t)fsz)
+            goto fail;
+        if (c->sb.file_count > c->sb.inode_size / CFS_INODE_FIXED_SIZE)
+            goto fail;
+    }
     if (c->sb.file_count == 0) return c;
 
     uint8_t *it = malloc(c->sb.inode_size);

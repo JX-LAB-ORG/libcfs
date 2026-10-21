@@ -1,4 +1,4 @@
-.PHONY: test testall clean
+.PHONY: test testall clean fuzz
 
 # Target-specific ISA flags: NEON on aarch64, a conservative x86-64 baseline
 # elsewhere (the NEON paths are compiled out there).  Override with ARCHFLAGS=.
@@ -160,9 +160,13 @@ testall: test cfs-tool cfs_preload.so cfs_block_hook.so
 	./test/cfs_block_hook_test.sh
 	@echo "Tests: $(shell make test 2>&1 | grep '=== 0 failures ===' | wc -l)/10 passed"
 
+# Fuzz the container parser: libFuzzer + UBSan + guard pages (needs compiler-rt).
+fuzz:
+	sh test/fuzz.sh $(SECS)
+
 clean:
 	rm -f $(OBJS) cfs_preload.o cfs_preload.so cfs-tool cfs_block_hook.so cfs-fuse
 	rm -f test/iso_mk.o test/ext2_read.o test/vblk_probe test/iso_gen
 	rm -f test/cfs_test test/cfs_rw_test test/cfs_dir_test test/cfs_new_test test/cfs_compact_test test/cfs_block_test test/cfs_part_test test/cfs_stress_test test/vblk_probe
 	rm -f test/cfs_dedup_test test/cfs_dedup_write_test test/cfs_dedup_codec_test
-	rm -f test/bench_cfs
+	rm -f test/bench_cfs test/fuzz_cfs
