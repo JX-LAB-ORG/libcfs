@@ -128,6 +128,50 @@ int main(void) {
         free(got); free(disk);
     }
 
+    /* ── the physical quota, through the merge layer's append path ──
+     * store_append() is a different write path from cfs_block_write(), and a
+     * refusal there has to leave the reference tables untouched — the file
+     * must still resolve afterwards.  This is the one quota case the block
+     * layer's own test cannot reach. */
+    fprintf(stderr, "\n=== Quota through dedup ===\n");
+    {
+        const char *pq = "/tmp/test_dedup_quota.cfs";
+        unlink(pq);
+        CFS *q = cfs_create(pq);
+        T(q != NULL, "quota container");
+        if (q) {
+            uint8_t *orig = malloc(SZ), *want = malloc(SZ), *fresh = malloc(65536);
+            if (orig && want && fresh) {
+                fill(orig, SZ, 11);
+                memcpy(want, orig, SZ);
+                T(cfs_add_file(q, "q.bin", orig, SZ) == 0, "add q.bin");
+                T(cfs_finalise(q) == 0, "finalise q");
+                T(cfs_dedup_merge(q) == 0, "merge q");
+                uint64_t used = cfs_physical_used(q);
+                T(cfs_set_physical_limit(q, used + 262144) == 0, "quota = used + 256K");
+
+                int refused = 0, applied = 0;
+                for (int i = 0; i < 32; i++) {
+                    off_t off = (off_t)((unsigned)i % (SZ / 65536)) * 65536;
+                    fill(fresh, 65536, 90000u + (unsigned)i);   /* never matches */
+                    if (cfs_dedup_write(q, "q.bin", fresh, 65536, off) < 0) { refused = 1; break; }
+                    memcpy(want + off, fresh, 65536);
+                    applied++;
+                }
+                T(applied > 0, "dedup writes accepted until the quota is reached");
+                T(refused, "a dedup write is eventually refused");
+                T(cfs_physical_used(q) <= used + 262144, "host file stayed within the quota");
+                T(same(q, "q.bin", want, SZ), "the file still resolves after the refusal");
+                cfs_close(q);
+                q = cfs_open(pq, CFS_RDWR);
+                T(q != NULL && same(q, "q.bin", want, SZ), "and after a reopen");
+                if (q) cfs_close(q);
+            }
+            free(orig); free(want); free(fresh);
+        }
+        unlink(pq);
+    }
+
     /* ── maintenance, on its own container so @store starts small ── */
     fprintf(stderr, "\n=== GC ===\n");
     {

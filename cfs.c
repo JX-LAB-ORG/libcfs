@@ -1958,6 +1958,15 @@ static int dedup_pend_flush(CFS *c) {
 
 static int dedup_emit(CFS *c, const uint8_t *p, size_t n, uint64_t *out_off) {
     if (dedup_pend_ready(c) != 0) return -1;
+    /* The bytes reach @store only when the pending buffer is flushed, so the
+     * quota has to be answered here rather than at the flush: by then the
+     * caller has already put a reference into the table, and a refusal would
+     * strand that reference on bytes that were never written — the file
+     * stops resolving.  The projection is the position the whole pending
+     * buffer will occupy once appended (the append cursor plus everything
+     * buffered), charging raw bytes where the append will charge compressed
+     * ones: conservative, which is the right direction for a safety limit. */
+    if (cfs_phys_room(c, (off_t)c->sb.inode_offset, c->pend_n + n) != 0) return -1;
     if (c->pend_n + n > c->pend_cap && dedup_pend_flush(c) != 0) return -1;
     *out_off = c->pend_off + c->pend_n;
     memcpy(c->pend_buf + c->pend_n, p, n);
@@ -2053,6 +2062,24 @@ ssize_t cfs_dedup_write(CFS *c, const char *path, const void *vbuf, size_t size,
 
     if (dedup_range_matches(c, &c->dt, buf, off, size)) return (ssize_t)size;
 
+    /* Reserve for the whole write before touching anything.  The loop below
+     * emits and references one chunk at a time, so a refusal in the middle
+     * would leave the earlier chunks referenced but never stored — the file
+     * stops resolving.  Charging the raw size where the append will charge
+     * the compressed size is conservative, which is the right direction. */
+    if (cfs_phys_room(c, (off_t)c->sb.inode_offset, c->pend_n + size) != 0) return -1;
+
+    /* And a snapshot, for everything that is not the quota: an I/O failure
+     * part-way through has the same shape. */
+    size_t snap_n = c->dt.n;
+    uint64_t snap_ls = c->dt.logical_size;
+    CfsRef *snap = NULL;
+    if (snap_n) {
+        snap = malloc(snap_n * sizeof *snap);
+        if (!snap) return -1;
+        memcpy(snap, c->dt.v, snap_n * sizeof *snap);
+    }
+
     size_t done = 0;
     while (done < size) {
         size_t avail = size - done;
@@ -2070,17 +2097,29 @@ ssize_t cfs_dedup_write(CFS *c, const char *path, const void *vbuf, size_t size,
             hit = cfs_feat_index_get(&c->fi, k, (uint32_t)clen, &soff);
         }
         if (!hit) {
-            if (dedup_emit(c, buf + done, clen, &soff) != 0) return -1;
+            if (dedup_emit(c, buf + done, clen, &soff) != 0) goto rollback;
             if (clen >= CFS_CDC_MIN && dedup_fi_add(c, buf + done, clen, soff) != 0)
-                return -1;
+                goto rollback;
         }
-        if (dedup_table_put(&c->dt, off + done, clen, soff) != 0) return -1;
+        if (dedup_table_put(&c->dt, off + done, clen, soff) != 0) goto rollback;
         done += clen;
     }
     if (off + size > e->raw.orig_size) e->raw.orig_size = off + size;
     e->raw.mtime = (uint64_t)time(NULL);
     c->dt_dirty = 1;
+    free(snap);
     return (ssize_t)size;
+
+rollback:
+    /* Put the reference table back exactly as it was.  Bytes already staged
+     * in the pending buffer stay there and will be appended unreferenced, so
+     * they cost a little space until GC reclaims them and cannot corrupt
+     * anything; the feature index entries for them stay valid too, because
+     * those bytes do reach the store. */
+    if (snap) { memcpy(c->dt.v, snap, snap_n * sizeof *snap); free(snap); }
+    c->dt.n = snap_n;
+    c->dt.logical_size = snap_ls;
+    return -1;
 }
 
 /* ── maintenance: threshold-driven re-merge and store reclamation ──
