@@ -2,6 +2,7 @@
 #define CFS_H
 #include <stdint.h>
 #include <stddef.h>
+#include <stdio.h>      /* FILE, for cfs_verify()'s report stream */
 #include <sys/types.h>
 
 #ifdef __cplusplus
@@ -176,6 +177,8 @@ int     cfs_mkfs_ext4_install(CFS *cfs, uint64_t base_off, uint64_t size,
                               const uint8_t *iso_img, size_t iso_sz);
 int     cfs_mkfs_fat32(CFS *cfs, uint64_t disk_sz);
 int     cfs_mkfs_fat32_at(CFS *cfs, uint64_t base_off, uint64_t size);
+int     cfs_mkfs_exfat(CFS *cfs, uint64_t disk_sz);
+int     cfs_mkfs_exfat_at(CFS *cfs, uint64_t base_off, uint64_t size);
 int     cfs_mkfs_swap(CFS *cfs, uint64_t disk_sz);
 int     cfs_mkfs_swap_at(CFS *cfs, uint64_t base_off, uint64_t size);
 
@@ -221,6 +224,20 @@ int    cfs_finalise(CFS *cfs);
 
 /* ─── Stats ────────────────────────────────────────────────── */
 void   cfs_stats(CFS *cfs, CfsStats *out);
+
+/* ─── Container self-check ─────────────────────────────────────
+ * Walks the superblock, the inode table, every block table and every DEDUP
+ * reference table with a parser of its own — independent of cfs.c's, so the
+ * two disagreeing is itself a finding — and reports each inconsistency with
+ * the offending inode, path and field.  Read-only, and deliberately *not*
+ * taking a CFS*: it has to work on containers too broken for cfs_open() to
+ * accept, which is exactly the case worth checking.  Takes a path and writes
+ * its report to `out`.
+ *
+ * Returns the number of errors found (0 = consistent), or -1 if the file
+ * could not be opened at all. */
+#define CFS_VERIFY_DEEP  0x01   /* decode every block and re-read every file */
+int    cfs_verify(const char *path, unsigned flags, FILE *out);
 
 #ifdef __cplusplus
 }

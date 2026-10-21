@@ -21,12 +21,17 @@ static void usage(const char *prog) {
         "  install <iso> <size> <cfs> [-p <n>] [-g]\n"
         "                                  Install ISO content into ext4\n"
         "                                  (mkfs + populate, standalone disk)\n"
-        "                                  Format .cfs as ext4/fat32/swap\n"
+        "                                  Format .cfs as ext4/fat32/exfat/swap\n"
         "                                  -p <n>: format inside partition n\n"
         "                                  -g:     GPT partition table (with -p)\n"
         "  ls     <cfs>        [dir]        List contents\n"
         "  cat    <cfs>        <path>       Print file to stdout\n"
         "  stat   <cfs>        [path]       Show stats or file info\n"
+        "  verify <cfs>        [--deep]     Self-check container structures\n"
+        "                                  (superblock, inode/block tables, dedup\n"
+        "                                  refs, @store accounting); --deep also\n"
+        "                                  decodes every block and re-reads every\n"
+        "                                  file through the library\n"
         "  mkdir  <cfs>        <path>       Create directory\n"
         "  rm     <cfs>        <path>       Remove file\n"
         "  mv     <cfs>        <old> <new>  Rename file\n"
@@ -271,6 +276,17 @@ int main(int argc, char *argv[]) {
         return 0;
     }
 
+    if (!strcmp(cmd, "verify")) {
+        if (argc < 3) { usage(argv[0]); return 1; }
+        unsigned vf = 0;
+        for (int i = 3; i < argc; i++) if (!strcmp(argv[i], "--deep")) vf |= CFS_VERIFY_DEEP;
+        /* Unlike the other commands this one does not go through cfs_open():
+         * a container cfs_open() rejects is the one most worth verifying. */
+        int rc = cfs_verify(argv[2], vf, stdout);
+        if (rc < 0) { perror(argv[2]); return 1; }
+        return rc ? 1 : 0;
+    }
+
     if (!strcmp(cmd, "mkdir")) {
         if (argc < 4) { usage(argv[0]); return 1; }
         CFS *c = cfs_open(argv[2], CFS_RDWR);
@@ -387,9 +403,10 @@ int main(int argc, char *argv[]) {
 
         int is_ext4 = !strcmp(fstype, "ext4");
         int is_fat32 = !strcmp(fstype, "fat32");
+        int is_exfat = !strcmp(fstype, "exfat");
         int is_swap = !strcmp(fstype, "swap");
-        if (!is_ext4 && !is_fat32 && !is_swap) {
-            fprintf(stderr, "mkfs: only ext4/fat32/swap are supported\n");
+        if (!is_ext4 && !is_fat32 && !is_exfat && !is_swap) {
+            fprintf(stderr, "mkfs: only ext4/fat32/exfat/swap are supported\n");
             return 1;
         }
 
@@ -441,10 +458,12 @@ int main(int argc, char *argv[]) {
             }
             if (is_ext4) rc = cfs_mkfs_ext4_at(c, p.start, p.size);
             else if (is_fat32) rc = cfs_mkfs_fat32_at(c, p.start, p.size);
+            else if (is_exfat) rc = cfs_mkfs_exfat_at(c, p.start, p.size);
             else rc = cfs_mkfs_swap_at(c, p.start, p.size);
         } else {
             if (is_ext4) rc = cfs_mkfs_ext4(c, disk_sz);
             else if (is_fat32) rc = cfs_mkfs_fat32(c, disk_sz);
+            else if (is_exfat) rc = cfs_mkfs_exfat(c, disk_sz);
             else rc = cfs_mkfs_swap(c, disk_sz);
         }
         cfs_finalise(c);
@@ -456,7 +475,7 @@ int main(int argc, char *argv[]) {
                (unsigned long long)(disk_sz >> 20), fstype, out);
         if (!part)
             printf("     mount with: cfs_block_hook.so + mount -t %s /dev/vda /mnt\n",
-                   is_ext4 ? "ext4" : (is_fat32 ? "vfat" : "swap"));
+                   is_ext4 ? "ext4" : (is_fat32 ? "vfat" : (is_exfat ? "exfat" : "swap")));
         else
             printf("     partition table: %s, fs on partition 1\n", gpt ? "gpt" : "mbr");
         return 0;

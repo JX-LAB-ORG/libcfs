@@ -10,7 +10,7 @@ ARCHFLAGS ?= -march=x86-64-v2
 endif
 CFLAGS = -std=gnu11 -fPIC -Wall -O3 $(ARCHFLAGS) -I. -I..
 
-OBJS = cfs.o cfs_part.o cfs_dedup.o cfs_mkfs_ext4.o cfs_mkfs_fat32.o cfs_ext4_install.o cfs_iso9660.o
+OBJS = cfs.o cfs_part.o cfs_dedup.o cfs_verify.o cfs_mkfs_ext4.o cfs_mkfs_fat32.o cfs_mkfs_exfat.o cfs_ext4_install.o cfs_iso9660.o
 CPENC = ../libcpool/cpenc.o ../libcpool/bwt.o
 
 all: $(OBJS) cfs-tool cfs_block_hook.so
@@ -24,6 +24,11 @@ cfs_part.o: cfs_part.c cfs_part.h cfs_internal.h cfs_format.h
 cfs_dedup.o: cfs_dedup.c cfs_dedup.h cfs_format.h
 	cc $(CFLAGS) -c cfs_dedup.c -o cfs_dedup.o
 
+# Container self-check: needs the same codec cfs.c decodes with, but none of
+# cfs.c's internals — it parses the container itself (see cfs_verify.c).
+cfs_verify.o: cfs_verify.c cfs.h cfs_format.h cfs_dedup.h ../libcpool/cpenc.h
+	cc $(CFLAGS) -c cfs_verify.c -o cfs_verify.o
+
 # Shared codec lives in the sibling project; build it on demand so a clean
 # checkout can run the tests without a manual step there first.
 ../libcpool/%.o:
@@ -31,6 +36,9 @@ cfs_dedup.o: cfs_dedup.c cfs_dedup.h cfs_format.h
 
 cfs_mkfs_fat32.o: cfs_mkfs_fat32.c cfs.h
 	cc $(CFLAGS) -c cfs_mkfs_fat32.c -o cfs_mkfs_fat32.o
+
+cfs_mkfs_exfat.o: cfs_mkfs_exfat.c cfs.h
+	cc $(CFLAGS) -c cfs_mkfs_exfat.c -o cfs_mkfs_exfat.o
 
 cfs_mkfs_ext4.o: cfs_mkfs_ext4.c cfs.h
 	cc $(CFLAGS) -c cfs_mkfs_ext4.c -o cfs_mkfs_ext4.o
@@ -50,8 +58,8 @@ test/ext2_read.o: test/ext2_read.c
 cfs_preload.so: cfs_preload.c cfs.o cfs_dedup.o ../libcpool/cpenc.o ../libcpool/bwt.o
 	cc $(CFLAGS) -fPIC cfs_preload.c cfs.o cfs_dedup.o ../libcpool/cpenc.o ../libcpool/bwt.o -shared -ldl -lm -o cfs_preload.so
 
-cfs-tool: cfs-tool.c cfs.o cfs_part.o cfs_dedup.o cfs_mkfs_fat32.o cfs_mkfs_ext4.c cfs_mkfs_swap.c cfs_ext4_install.o cfs_iso9660.o ../libcpool/cpenc.o ../libcpool/bwt.o
-	cc $(CFLAGS) cfs-tool.c cfs.o cfs_part.o cfs_dedup.o cfs_mkfs_fat32.o cfs_mkfs_ext4.c cfs_mkfs_swap.c cfs_ext4_install.o cfs_iso9660.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o cfs-tool
+cfs-tool: cfs-tool.c cfs.o cfs_part.o cfs_dedup.o cfs_verify.o cfs_mkfs_fat32.o cfs_mkfs_exfat.o cfs_mkfs_ext4.c cfs_mkfs_swap.c cfs_ext4_install.o cfs_iso9660.o ../libcpool/cpenc.o ../libcpool/bwt.o
+	cc $(CFLAGS) cfs-tool.c cfs.o cfs_part.o cfs_dedup.o cfs_verify.o cfs_mkfs_fat32.o cfs_mkfs_exfat.o cfs_mkfs_ext4.c cfs_mkfs_swap.c cfs_ext4_install.o cfs_iso9660.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o cfs-tool
 
 cfs_block_hook.so: cfs_block_hook.c cfs.o cfs_part.o cfs_dedup.o ../libcpool/cpenc.o ../libcpool/bwt.o
 	cc $(CFLAGS) -fPIC cfs_block_hook.c cfs.o cfs_part.o cfs_dedup.o ../libcpool/cpenc.o ../libcpool/bwt.o -shared -ldl -lm -o cfs_block_hook.so
