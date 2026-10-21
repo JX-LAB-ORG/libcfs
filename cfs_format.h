@@ -20,6 +20,12 @@
 #define CFS_VERSION     2
 #define CFS_BLOCK_SPLIT  (64ULL * 1024 * 1024)  /* split files at 64MB per block */
 
+/* Hard ceiling on one block's decompressed size, matching the codec's own
+ * CPENC_MAX_BLOCK.  cfs never emits anything near this (CFS_BLOCK_SPLIT is
+ * 64MB); it exists so a corrupt block table cannot ask the read path for a
+ * 4GB allocation. */
+#define CFS_BLOCK_MAX    (256u << 20)
+
 typedef struct {
     char     magic[8];       /* "LIBCFS02" */
     uint16_t version;        /* 2 */

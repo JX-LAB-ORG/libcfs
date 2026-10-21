@@ -403,6 +403,17 @@ ssize_t cfs_read(CFS *c,const char *path,void *buf,size_t size,off_t offset){
         /* Read overlapping portion of this block */
         uint64_t ob=(uint64_t)offset-blk_off;
         size_t nl=(size_t)(blk_end-(uint64_t)offset);if(nl>rem)nl=rem;
+        /* Both sizes come from the inode table, which is as untrusted as the
+         * data: cap the compressed one by the file it has to live in, and
+         * the decompressed one by what the decoder itself accepts.  Without
+         * this a corrupt block table asks for 4GB here, per block. */
+        {
+            uint64_t cs = e->raw.blocks[b].comp_size, os = e->raw.blocks[b].orig_size;
+            off_t fsz = lseek(c->fd, 0, SEEK_END);
+            if (cs == 0 || os > CFS_BLOCK_MAX || fsz < 0 ||
+                (uint64_t)e->raw.blocks[b].offset + cs > (uint64_t)fsz)
+                return (ssize_t)total > 0 ? (ssize_t)total : -1;
+        }
         uint8_t *comp=malloc(e->raw.blocks[b].comp_size),*dec=malloc(e->raw.blocks[b].orig_size);
         if(!comp||!dec){free(comp);free(dec);return(ssize_t)total>0?(ssize_t)total:-1;}
         size_t dl=e->raw.blocks[b].orig_size;
