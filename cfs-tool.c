@@ -7,8 +7,16 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-static void usage(const char *prog) {
-    fprintf(stderr,
+/* Container paths are stored without a leading slash — the FUSE layer strips
+ * it on the way in — but on the command line everyone types one.  ls already
+ * accepted both, which made the other commands silently not finding
+ * "/a.txt" read like a missing file rather than a path form. */
+static const char *cpath(const char *p) {
+    while (p && *p == '/') p++;
+    return p ? p : "";
+}
+
+static void usage(const char *prog) {    fprintf(stderr,
         "Usage: %s <command> [args...]\n"
         "\n"
         "Commands:\n"
@@ -196,7 +204,7 @@ int main(int argc, char *argv[]) {
         if (!buf) { fclose(sf); cfs_close(c); return 1; }
         fread(buf, 1, sz, sf); fclose(sf);
 
-        int rc = cfs_write(c, argv[3], buf, sz);
+        int rc = cfs_write(c, cpath(argv[3]), buf, sz);
         free(buf);
         cfs_close(c);
         if (rc) { fprintf(stderr, "write failed: %d\n", rc); return 1; }
@@ -208,7 +216,7 @@ int main(int argc, char *argv[]) {
         if (argc < 5) { usage(argv[0]); return 1; }
         CFS *c = cfs_open(argv[2], CFS_RDONLY);
         if (!c) { perror(argv[2]); return 1; }
-        int rc = cfs_unpack(c, argv[3], argv[4]);
+        int rc = cfs_unpack(c, cpath(argv[3]), argv[4]);
         cfs_close(c);
         if (rc) { fprintf(stderr, "unpack failed\n"); return 1; }
         return 0;
@@ -239,7 +247,7 @@ int main(int argc, char *argv[]) {
         if (!c) { perror(argv[2]); return 1; }
 
         size_t sz;
-        void *data = cfs_read_all(c, argv[3], &sz);
+        void *data = cfs_read_all(c, cpath(argv[3]), &sz);
         if (!data) { fprintf(stderr, "%s: not found\n", argv[3]); cfs_close(c); return 1; }
 
         fwrite(data, 1, sz, stdout);
@@ -255,7 +263,7 @@ int main(int argc, char *argv[]) {
 
         if (argc > 3) {
             CfsStat st;
-            if (cfs_stat(c, argv[3], &st) == 0)
+            if (cfs_stat(c, cpath(argv[3]), &st) == 0)
                 printf("%s: size=%llu mtime=%llu mode=%u blocks=%u\n",
                        argv[3],
                        (unsigned long long)st.size,
@@ -291,7 +299,7 @@ int main(int argc, char *argv[]) {
         if (argc < 4) { usage(argv[0]); return 1; }
         CFS *c = cfs_open(argv[2], CFS_RDWR);
         if (!c) { perror(argv[2]); return 1; }
-        int rc = cfs_mkdir(c, argv[3]);
+        int rc = cfs_mkdir(c, cpath(argv[3]));
         if (rc) fprintf(stderr, "mkdir %s failed (errno=%d)\n", argv[3], errno);
         cfs_close(c);
         return rc ? 1 : 0;
@@ -301,7 +309,7 @@ int main(int argc, char *argv[]) {
         if (argc < 4) { usage(argv[0]); return 1; }
         CFS *c = cfs_open(argv[2], CFS_RDWR);
         if (!c) { perror(argv[2]); return 1; }
-        int rc = cfs_unlink(c, argv[3]);
+        int rc = cfs_unlink(c, cpath(argv[3]));
         if (rc) fprintf(stderr, "rm %s failed (errno=%d)\n", argv[3], errno);
         cfs_close(c);
         return rc ? 1 : 0;
@@ -311,7 +319,7 @@ int main(int argc, char *argv[]) {
         if (argc < 5) { usage(argv[0]); return 1; }
         CFS *c = cfs_open(argv[2], CFS_RDWR);
         if (!c) { perror(argv[2]); return 1; }
-        int rc = cfs_rename(c, argv[3], argv[4]);
+        int rc = cfs_rename(c, cpath(argv[3]), cpath(argv[4]));
         if (rc) fprintf(stderr, "mv %s %s failed (errno=%d)\n", argv[3], argv[4], errno);
         cfs_close(c);
         return rc ? 1 : 0;
@@ -321,7 +329,7 @@ int main(int argc, char *argv[]) {
         if (argc < 5) { usage(argv[0]); return 1; }
         CFS *c = cfs_open(argv[2], CFS_RDWR);
         if (!c) { perror(argv[2]); return 1; }
-        int rc = cfs_symlink(c, argv[3], argv[4]);
+        int rc = cfs_symlink(c, argv[3], cpath(argv[4]));
         if (rc) fprintf(stderr, "symlink failed (errno=%d)\n", errno);
         cfs_close(c);
         return rc ? 1 : 0;
@@ -332,7 +340,7 @@ int main(int argc, char *argv[]) {
         CFS *c = cfs_open(argv[2], CFS_RDWR);
         if (!c) { perror(argv[2]); return 1; }
         uint64_t sz = strtoull(argv[4], NULL, 0);
-        int rc = cfs_truncate(c, argv[3], sz);
+        int rc = cfs_truncate(c, cpath(argv[3]), sz);
         if (rc) fprintf(stderr, "trunc failed (errno=%d)\n", errno);
         cfs_close(c);
         return rc ? 1 : 0;
