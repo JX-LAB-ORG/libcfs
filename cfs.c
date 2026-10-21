@@ -336,12 +336,16 @@ CFS *cfs_open(const char *path, int flags) {
             e->raw.blocks[b].comp_size = rd32(p); p += 4;
             e->raw.blocks[b].orig_size = rd32(p); p += 4;
         }
-        if (e->raw.path_len && (size_t)(end - p) >= e->raw.path_len) {
-            e->path = malloc(e->raw.path_len + 1);
-            memcpy(e->path, p, e->raw.path_len);
-            e->path[e->raw.path_len] = 0;
-            p += e->raw.path_len;
-        }
+        /* The path has to be there.  Leaving e->path NULL with a non-zero
+         * path_len used to "work" for reads — lu() checks for NULL — and
+         * then crash the first write, because cfs_sync serialises path_len
+         * bytes from it.  A table whose paths do not fit is malformed. */
+        if (e->raw.path_len == 0 || (size_t)(end - p) < e->raw.path_len) goto fail;
+        e->path = malloc(e->raw.path_len + 1);
+        if (!e->path) goto fail;
+        memcpy(e->path, p, e->raw.path_len);
+        e->path[e->raw.path_len] = 0;
+        p += e->raw.path_len;
         /* Reserved entries (@block, @store) are internal: they are not
          * user files and would double-count merged bytes. */
         if (!(e->path && e->path[0] == '@')) {
@@ -1110,6 +1114,9 @@ ssize_t cfs_block_read(CFS *c, void *buf, size_t size, off_t offset) {
     return (ssize_t)total;
 }
 
+#define BLOCK_CHUNK (8u << 20)   /* 8MB compression unit: bounds RMW cost */
+#define PEND_MAX 128              /* pending-patch slots per write (<=2 touched) */
+
 /* ── Block-write path: block-granular patching ───────────────────
  * Random writes touch only the blocks they overlap (decompress →
  * patch → recompress → rewrite in place, or append if the recompressed
@@ -1138,6 +1145,13 @@ static int block_patch(CFS *c, InodeEntry *e, uint32_t b, const uint8_t *src,
                        uint64_t w0, uint64_t po, uint64_t pe, size_t ext,
                        uint8_t *pend_data[], uint32_t pend_idx[], size_t pend_cl[], size_t pend_orig[], int *np) {
     CfsBlock *blk = &e->raw.blocks[b];
+    /* The device layer never makes a block larger than BLOCK_CHUNK, and
+     * orig_size comes from the inode table: a corrupt table can declare a
+     * 256MB block, and patching it allocates, decompresses and recompresses
+     * that much — fuzzing found an 8.5-second write from a 746-byte
+     * container.  Reject anything the chunking discipline could not have
+     * produced. */
+    if (blk->orig_size > CFS_BLOCK_MAX) return -1;
     uint32_t olen = blk->orig_size;
     uint32_t nolen = olen + (uint32_t)ext;
     uint64_t bo = block_blk_start(e, b);
@@ -1254,6 +1268,17 @@ static int block_hole_pack(CFS *c, const uint8_t *seg, size_t len,
 static int block_write_fallback(CFS *c, const uint8_t *buf, size_t size,
                                 uint64_t offset, uint64_t minsz, uint64_t prev_sz) {
     uint64_t new_sz = minsz > prev_sz ? minsz : prev_sz;
+    /* This path materialises the whole device, and the device's declared
+     * size comes from the inode table — as untrusted as anything else.  A
+     * crafted container with a full block table and a multi-gigabyte
+     * declared size turns every write into a multi-gigabyte allocation
+     * (fuzzing found it at 2.1GB RSS).  Real devices cannot reach this path
+     * at all: it only runs when the block table would exceed
+     * CFS_BLOCK_SANITY, which is 512GB of 8MB blocks. */
+    if (new_sz > (uint64_t)CFS_BLOCK_MAX * 4) {
+        errno = ENOSPC;
+        return -1;
+    }
     size_t rbsz = 0;
     void *old = cfs_read_all(c, BLOCK_PATH, &rbsz);
     uint8_t *full = calloc(1, new_sz);
@@ -1266,8 +1291,6 @@ static int block_write_fallback(CFS *c, const uint8_t *buf, size_t size,
     return rc;
 }
 
-#define BLOCK_CHUNK (8u << 20)   /* 8MB compression unit: bounds RMW cost */
-#define PEND_MAX 128              /* pending-patch slots per write (<=2 touched) */
 
 /* Short-write form: cut the request at 8MB boundaries and stop at the first
  * piece that is refused, reporting how far it got.  The pieces never
@@ -1391,6 +1414,26 @@ static int cfs_block_write_impl(CFS *c, const void *buf, size_t size, off_t offs
                                    size - part, (off_t)blk_limit);
         }
         uint64_t pad = w0 - cur_end;
+        /* Fill a far gap in chunk-sized zero blocks rather than one
+         * allocation of the whole thing.  The gap is materialised because
+         * block layout has to stay gap-free, and w0 comes from the device
+         * size the container declares: one allocation of it turned a
+         * 746-byte container into a 2GB allocation and eight seconds of
+         * work (fuzzing found both).  The total is still capped — that is a
+         * time bound, not a memory one. */
+        if (pad > BLOCK_CHUNK) {
+            if (pad > (1ULL << 30)) { errno = ENOSPC; return -1; }
+            uint8_t *z = calloc(1, BLOCK_CHUNK);
+            if (!z) return -1;
+            uint64_t left = pad, at = cur_end;
+            while (left) {
+                size_t zn = left > BLOCK_CHUNK ? BLOCK_CHUNK : (size_t)left;
+                if (cfs_block_write(c, z, zn, (off_t)at) != 0) { free(z); return -1; }
+                at += zn; left -= zn;
+            }
+            free(z);
+            return cfs_block_write(c, src, size, (off_t)w0);
+        }
         if (pad == 0) {
             if (nb > 0 && e->raw.blocks[nb-1].orig_size >= BLOCK_CHUNK) {
                 /* last block full — start a fresh one */

@@ -77,6 +77,43 @@ int LLVMFuzzerTestOneInput(const uint8_t *d, size_t n) {
         cfs_close(c);
     }
 
+    /* Write phase: the same bytes, now driven through the writers.  Reads
+     * only parse; the writers build on what they parsed and then move data,
+     * and that is the shape of the bug that set a block's orig_size before
+     * its write landed.  A malformed container reaches these paths as a
+     * matter of course here. */
+    CFS *w = cfs_open(TMP, CFS_RDWR);
+    if (w) {
+        size_t plen = n > 4096 ? 4096 : n;
+        const uint8_t *pl = d + (n - plen);
+        uint32_t seed = 0;
+        memcpy(&seed, d, 4);
+
+        cfs_mkdir(w, "/fz");
+        cfs_write(w, "/fz/a", pl, plen);
+        cfs_truncate(w, "/fz/a", plen / 2);
+        cfs_rename(w, "/fz/a", "/fz/b");
+        cfs_unlink(w, "/fz/b");
+        cfs_mkdir(w, "/fz/sub");
+
+        /* Device write at an offset derived from the input, when the
+         * container actually has a device of non-zero size. */
+        /* Only on a small device: a write into an 8MB block pays a real
+         * decompress+recompress, which belongs to the codec target and
+         * not to this one. */
+        uint64_t bsz = cfs_block_size(w);
+        if (bsz && bsz <= (2u << 20)) {
+            size_t bl = plen < 4096 ? plen : 4096;
+            /* keep the write inside the first 16MB: a far write has to
+             * materialise the zero gap, and compressing that is real work
+             * that tells the fuzzer nothing about the structure. */
+            uint64_t span = bsz < (16u << 20) ? bsz : (16u << 20);
+            off_t off = (off_t)(seed % span);
+            cfs_block_write(w, pl, bl, off);
+        }
+        cfs_close(w);
+    }
+
     /* The self-check has to survive the same bytes: it is what gets pointed
      * at a damaged container first, and it parses independently of cfs.c. */
     FILE *nul = fopen("/dev/null", "w");
