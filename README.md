@@ -51,7 +51,8 @@ This section matters more than the one above:
 ## Building
 
 ```sh
-make -C ../libcpool        # the codec lives in the sibling repository
+git clone https://github.com/JX-LAB-ORG/cpenc ../libcpool   # the CPEnc codec
+make -C ../libcpool
 make                       # cfs-tool / cfs-fuse / cfs_block_hook.so / cfs_preload.so
 ```
 
@@ -219,7 +220,7 @@ requires an external tool.
   testing section above for how to run them.
 - cpenc has been compared head to head against xz/zstd/gzip/lz4 on a real disk
   image (673MB ext4, 3.68x, 4.29 MB/s compress, 164 MB/s decompress); the
-  reproduction script is `libcpool/test/bench_image.sh`.
+  reproduction script is `test/bench_image.sh` in the cpenc repository.
 
 ## License
 
