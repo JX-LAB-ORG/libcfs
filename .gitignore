@@ -16,6 +16,7 @@ test/cfs_stress_test
 test/cfs_install_test
 test/cfs_dedup_test
 test/cfs_dedup_codec_test
+test/cfs_path_test
 test/cfs_dedup_write_test
 test/iso_gen
 .mountwork
