@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include "cfs_path.h"
 #include <stdint.h>
 #include <dlfcn.h>
 #include <stdio.h>
@@ -154,6 +155,27 @@ __attribute__((constructor)) static void _init(void) {
     strncpy(cfs_mount, m, 511); cfs_mount[511] = 0;
     strncpy(cfs_path, f, 511);  cfs_path[511] = 0;
     cfs = cfs_open(f, CFS_RDWR | CFS_RAW);
+    if (!cfs) {
+        /* The mount is a process tree, not a process: every child re-opens
+         * the container, and the first one holds the exclusive lock.  So
+         * `sh -c 'cd /mnt; ls'` mounted in the shell and came up empty in
+         * ls, which reported FAILED and went on to serve host paths.  The
+         * tree is one logical client — membership is passed down through
+         * the environment, and only a process that mounted the same file
+         * skips the lock.  Any handle outside the tree still takes it, so
+         * an external writer is refused exactly as before. */
+        const char *tree = getenv("CFS_MOUNT_TREE");
+        if (tree && !strcmp(tree, f)) {
+            const char *prev = getenv("CFS_NO_LOCK");
+            char keep[8];
+            snprintf(keep, sizeof keep, "%s", prev ? prev : "");
+            setenv("CFS_NO_LOCK", "1", 1);
+            cfs = cfs_open(f, CFS_RDWR | CFS_RAW);
+            if (prev) setenv("CFS_NO_LOCK", keep, 1);
+            else      unsetenv("CFS_NO_LOCK");
+        }
+    }
+    if (cfs) setenv("CFS_MOUNT_TREE", f, 1);
     memset(vfds, 0, sizeof(vfds));
     if (cfs) {
         /* Pre-create all cfs directories so chdir works immediately */
@@ -227,45 +249,18 @@ static int is_cfs_dir(const char *rel) {
 }
 
 /* ─── Path resolution ───────────────────────────────────────────── */
+/* The string work lives in cfs_path.c: it takes application-controlled
+ * input, it is the part worth testing, and keeping it free of the
+ * interposed symbols lets a test call it directly. */
 static int resolve(const char *p, char *out, size_t n) {
     if (!p || !cfs) return 0;
-    size_t ml = strlen(cfs_mount);
-
-    /* Absolute path under mount point */
-    if (!strncmp(p, cfs_mount, ml)) {
-        const char *r = p + ml;
-        while (*r == '/') r++;
-        if (!*r) { out[0] = 0; ensure_real_dir(out, is_cfs_dir(out)); return 1; }
-        strncpy(out, r, n - 1); out[n - 1] = 0;
-        ensure_real_dir(out, is_cfs_dir(out));
-        return 1;
+    char cwd[512];
+    const char *c = NULL;
+    if (p[0] != '/') {
+        if (getcwd(cwd, sizeof(cwd)) < 0) return 0;
+        c = cwd;
     }
-
-    /* Absolute path not under mount — not ours */
-    if (p[0] == '/') return 0;
-
-    /* Relative path — use kernel CWD + lazy real dir creation */
-    char real_cwd[512];
-    if (getcwd(real_cwd, sizeof(real_cwd)) < 0) return 0;
-    if (strncmp(real_cwd, cfs_mount, ml)) return 0;
-    const char *base = real_cwd + ml;
-    while (*base == '/') base++;
-    const char *clean = p;
-    while (!strncmp(clean, "./", 2)) clean += 2;
-    if (!strcmp(clean, ".") || clean[0] == 0) {
-        strncpy(out, base, n-1); out[n-1]=0; ensure_real_dir(out, is_cfs_dir(out)); return 1;
-    }
-    if (!strcmp(clean, "..")) {
-        strncpy(out, base, n-1); out[n-1]=0;
-        char *slash = strrchr(out, '/');
-        if (slash) *slash = 0; else out[0] = 0;
-        ensure_real_dir(out, is_cfs_dir(out));
-        return 1;
-    }
-    if (base[0])
-        snprintf(out, n, "%s/%s", base, clean);
-    else
-        strncpy(out, clean, n-1), out[n-1]=0;
+    if (!cfs_resolve_path(cfs_mount, c, p, out, n)) return 0;
     ensure_real_dir(out, is_cfs_dir(out));
     return 1;
 }

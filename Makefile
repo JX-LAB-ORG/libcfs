@@ -55,8 +55,11 @@ test/iso_mk.o: test/iso_mk.c
 test/ext2_read.o: test/ext2_read.c
 	cc $(CFLAGS) -c test/ext2_read.c -o test/ext2_read.o
 
-cfs_preload.so: cfs_preload.c cfs.o cfs_dedup.o ../libcpool/cpenc.o ../libcpool/bwt.o
-	cc $(CFLAGS) -fPIC cfs_preload.c cfs.o cfs_dedup.o ../libcpool/cpenc.o ../libcpool/bwt.o -shared -ldl -lm -o cfs_preload.so
+cfs_path.o: cfs_path.c cfs_path.h
+	cc $(CFLAGS) -c cfs_path.c -o cfs_path.o
+
+cfs_preload.so: cfs_preload.c cfs_path.o cfs.o cfs_dedup.o ../libcpool/cpenc.o ../libcpool/bwt.o
+	cc $(CFLAGS) -fPIC cfs_preload.c cfs_path.o cfs.o cfs_dedup.o ../libcpool/cpenc.o ../libcpool/bwt.o -shared -ldl -lm -o cfs_preload.so
 
 cfs-tool: cfs-tool.c cfs.o cfs_part.o cfs_dedup.o cfs_verify.o cfs_mkfs_fat32.o cfs_mkfs_exfat.o cfs_mkfs_ext4.c cfs_mkfs_swap.c cfs_ext4_install.o cfs_iso9660.o ../libcpool/cpenc.o ../libcpool/bwt.o
 	cc $(CFLAGS) cfs-tool.c cfs.o cfs_part.o cfs_dedup.o cfs_verify.o cfs_mkfs_fat32.o cfs_mkfs_exfat.o cfs_mkfs_ext4.c cfs_mkfs_swap.c cfs_ext4_install.o cfs_iso9660.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o cfs-tool
@@ -105,6 +108,9 @@ test: $(OBJS) $(CPENC) test/iso_mk.o test/ext2_read.o
 	@echo "=== cfs_dedup_codec_test ==="
 	cc $(CFLAGS) test/cfs_dedup_codec_test.c cfs_dedup.c -o test/cfs_dedup_codec_test
 	./test/cfs_dedup_codec_test
+	@echo "=== cfs_path_test ==="
+	cc $(CFLAGS) test/cfs_path_test.c cfs_path.c -o test/cfs_path_test
+	./test/cfs_path_test
 
 # Container-level benchmark: sequential/random I/O, small files, compact.
 bench: test/bench_cfs test/bench_gen test/bench_tables
@@ -161,7 +167,7 @@ testall: test cfs-tool cfs_preload.so cfs_block_hook.so
 	cc $(CFLAGS) test/vblk_probe.c -o test/vblk_probe
 	chmod +x test/cfs_block_hook_test.sh
 	./test/cfs_block_hook_test.sh
-	@echo "Tests: $(shell make test 2>&1 | grep '=== 0 failures ===' | wc -l)/10 passed"
+	@echo "Tests: $(shell make test 2>&1 | grep '=== 0 failures ===' | wc -l)/11 passed"
 
 # Fuzz the container parser: libFuzzer + UBSan + guard pages (needs compiler-rt).
 fuzz:
