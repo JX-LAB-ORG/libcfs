@@ -6,16 +6,39 @@
 set -u
 cd "$(dirname "$0")/.." || exit 1
 CT=./cfs-tool
-T=$(mktemp -d /tmp/cfs_fsck_XXXXXX) || exit 1
+# These disks are gigabyte-sized: the 1G case needs about as much scratch space
+# as the disk itself.  /tmp is a small tmpfs on some machines (2G here), and
+# running out of it fails deep inside the export, where it looks like an
+# installer bug.  CFS_FSCK_WORK, then TMPDIR, then /tmp.
+TMPROOT=${CFS_FSCK_WORK:-${TMPDIR:-/tmp}}
+T=$(mktemp -d "$TMPROOT/cfs_fsck_XXXXXX") || exit 1
 fail=0
 
 # e2fsck lives in /sbin, which is often not on a non-root PATH
 E2FSCK=$(command -v e2fsck 2>/dev/null || echo /sbin/e2fsck)
 [ -x "$E2FSCK" ] || { echo "SKIP: e2fsck not installed"; rm -rf "$T"; exit 0; }
 
+# The export is streamed straight into dd, so one disk image is live at a
+# time; 1G plus a little slack is the floor.  Say so up front rather than
+# letting ENOSPC surface as "the installer produced a bad filesystem".
+have_k=$(df -Pk "$TMPROOT" 2>/dev/null | awk 'NR==2{print $4}')
+case ${have_k:-x} in ''|*[!0-9]*) have_k=0 ;; esac
+if [ "$have_k" -lt 1150000 ]; then
+    echo "SKIP: ${TMPROOT} has ${have_k}K free, the 1G case needs ~1.1G of scratch"
+    echo "      set TMPDIR (or CFS_FSCK_WORK) to a larger filesystem"
+    rm -rf "$T"; exit 0
+fi
+
 check_disk() {          # check_disk <label> <cfs> <partition_offset_sectors>
-    $CT cat "$2" @block > "$T/img" 2>/dev/null || { echo "FAIL $1: export"; fail=$((fail+1)); return; }
-    dd if="$T/img" of="$T/part" bs=512 skip="$3" 2>/dev/null
+    # Stream the device through a fifo: a temp copy of a 1G disk plus its
+    # partition slice is 2G, and that alone overflowed /tmp on x86.
+    mkfifo "$T/fifo" || { echo "FAIL $1: fifo"; fail=$((fail+1)); return; }
+    $CT cat "$2" @block > "$T/fifo" 2>/dev/null &
+    cpid=$!
+    dd if="$T/fifo" of="$T/part" bs=512 skip="$3" 2>/dev/null
+    wait "$cpid" || { echo "FAIL $1: export"; fail=$((fail+1)); rm -f "$T/fifo"; return; }
+    rm -f "$T/fifo"
+    [ -s "$T/part" ] || { echo "FAIL $1: empty export"; fail=$((fail+1)); return; }
     if $E2FSCK -fn "$T/part" > "$T/fsck.log" 2>&1; then
         echo "OK   $1: $(tail -1 "$T/fsck.log")"
     else
