@@ -226,6 +226,7 @@ static int vread_range(VCtx *v, const VInode *in, uint8_t *dst, size_t n, uint64
         }
         uint64_t ob = off - cur;
         size_t nl = (size_t)(bend - off); if (nl > n - done) nl = n - done;
+        if (in->blk[b].orig > CFS_BLOCK_MAX) return -1;
         uint8_t *dec = malloc(in->blk[b].orig ? in->blk[b].orig : 1);
         if (!dec) return -1;
         char what[160];
@@ -343,6 +344,15 @@ static void check_blocks(VCtx *v, const VInode *in, uint32_t idx) {
             v->zero_sized++;
             vprob(v, C_BLK, 1, "inode %u \"%s\" block %u: comp_size=%u is smaller than a CPEnc header (%u)",
                   idx, nm, b, (unsigned)bl->comp, (unsigned)CPENC_HEADER_SIZE);
+            continue;
+        }
+        /* comp_size is bounded by the file it lives in; orig_size is not
+         * bounded by anything else, and --deep allocates it straight from
+         * the table.  A 4GB claim is a corrupt entry, not a large file. */
+        if (bl->orig > CFS_BLOCK_MAX) {
+            v->oob++;
+            vprob(v, C_BLK, 1, "inode %u \"%s\" block %u: orig_size=%u exceeds the block ceiling (%u)",
+                  idx, nm, b, (unsigned)bl->orig, (unsigned)CFS_BLOCK_MAX);
             continue;
         }
         if (bl->off < CFS_SB_SIZE) {
@@ -872,6 +882,7 @@ int cfs_verify(const char *path, unsigned flags, FILE *out) {
             if (e->mode == CFS_MODE_DIR || e->nblk == 0) continue;
             if (e->mode == CFS_MODE_DEDUP) continue;   /* table blocks already decoded */
             for (uint32_t b = 0; b < e->nblk; b++) {
+                if (e->blk[b].orig > CFS_BLOCK_MAX) continue;   /* reported above */
                 uint8_t *dec = malloc(e->blk[b].orig ? e->blk[b].orig : 1);
                 if (!dec) break;
                 char what[160];

@@ -304,13 +304,12 @@ CFS *cfs_open(const char *path, int flags) {
      * fuzzing the container parser found exactly that, as an out-of-memory
      * far from any crash inside cfs.  The table has to fit in the file, and
      * the entry count has to fit in the table. */
-    {
-        off_t fsz = lseek(c->fd, 0, SEEK_END);
-        if (fsz < 0 || (uint64_t)c->sb.inode_offset + (uint64_t)c->sb.inode_size > (uint64_t)fsz)
-            goto fail;
-        if (c->sb.file_count > c->sb.inode_size / CFS_INODE_FIXED_SIZE)
-            goto fail;
-    }
+    off_t fsz = lseek(c->fd, 0, SEEK_END);
+    if (fsz < 0) goto fail;
+    if ((uint64_t)c->sb.inode_offset + (uint64_t)c->sb.inode_size > (uint64_t)fsz)
+        goto fail;
+    if (c->sb.file_count > c->sb.inode_size / CFS_INODE_FIXED_SIZE)
+        goto fail;
     if (c->sb.file_count == 0) return c;
 
     uint8_t *it = malloc(c->sb.inode_size);
@@ -332,9 +331,21 @@ CFS *cfs_open(const char *path, int flags) {
         if (!e->raw.blocks) goto fail;
         if ((size_t)(end - p) < (size_t)e->raw.block_count * 16) goto fail;
         for (uint32_t b = 0; b < e->raw.block_count; b++) {
-            e->raw.blocks[b].offset    = rd64(p); p += 8;
-            e->raw.blocks[b].comp_size = rd32(p); p += 4;
-            e->raw.blocks[b].orig_size = rd32(p); p += 4;
+            CfsBlock *bl = &e->raw.blocks[b];
+            bl->offset    = rd64(p); p += 8;
+            bl->comp_size = rd32(p); p += 4;
+            bl->orig_size = rd32(p); p += 4;
+            /* Every user of a block entry trusts these three fields: the read
+             * path allocates the two sizes, the write path re-materialises
+             * the block before patching it, and compact copies comp_size
+             * bytes.  Reject a table entry the codec could not have produced
+             * or that points outside the file, once, here — a 522-byte
+             * container that declared comp_size = 1.7GB still made
+             * block_patch malloc it, which is the fifth time fuzzing found
+             * the same shape in a new place. */
+            if (bl->orig_size > CFS_BLOCK_MAX || bl->comp_size == 0) goto fail;
+            if (bl->comp_size > cpenc_max_compressed_size(bl->orig_size)) goto fail;
+            if ((uint64_t)bl->offset + bl->comp_size > (uint64_t)fsz) goto fail;
         }
         /* The path has to be there.  Leaving e->path NULL with a non-zero
          * path_len used to "work" for reads — lu() checks for NULL — and
@@ -1153,6 +1164,10 @@ static int block_patch(CFS *c, InodeEntry *e, uint32_t b, const uint8_t *src,
      * produced. */
     if (blk->orig_size > CFS_BLOCK_MAX) return -1;
     uint32_t olen = blk->orig_size;
+    /* ext is the tail of the caller's write.  nolen is 32-bit, so an ext
+     * past the ceiling wraps it and the copy below then writes past dec:
+     * the write is bounded in size, not in the arithmetic. */
+    if (ext > CFS_BLOCK_MAX || (uint64_t)olen + ext > CFS_BLOCK_MAX) return -1;
     uint32_t nolen = olen + (uint32_t)ext;
     uint64_t bo = block_blk_start(e, b);
     size_t clen = (size_t)(pe - po);
