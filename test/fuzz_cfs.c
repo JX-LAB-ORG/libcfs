@@ -73,7 +73,21 @@ int LLVMFuzzerTestOneInput(const uint8_t *d, size_t n) {
         /* the device layer and the block hook go through these */
         (void)cfs_block_size(c);
         CfsDiskAttrs da; (void)cfs_disk_get(c, &da);
-        (void)cfs_part_count(c);
+
+        /* Partition table: MBR and GPT parsing is our own code, fed by the
+         * same untrusted bytes as everything else.  cfs_part_count caches
+         * the parse; get/read walk it, and a GPT entry array is a much
+         * richer structure to get wrong than a 16-byte MBR row. */
+        int np = cfs_part_count(c);
+        for (int i = 1; i <= np && i <= 8; i++) {
+            CfsPartition pp;
+            if (cfs_part_get(c, i, &pp) != 0) continue;
+            size_t ml2; void *mb2;
+            uint8_t *pb = guard_buf(4096, &ml2, &mb2);
+            if (!pb) continue;
+            cfs_part_read(c, i, pb, 4096, 0);
+            munmap(mb2, ml2);
+        }
         cfs_close(c);
     }
 
@@ -101,6 +115,16 @@ int LLVMFuzzerTestOneInput(const uint8_t *d, size_t n) {
         /* Only on a small device: a write into an 8MB block pays a real
          * decompress+recompress, which belongs to the codec target and
          * not to this one. */
+        /* Editing an existing table drives the write side of the same
+         * parser: delete an entry, add one back at an offset the input
+         * chooses, then let verify walk whatever came out. */
+        int npw = cfs_part_count(w);
+        if (npw > 0 && npw < 8) {
+            cfs_part_del(w, npw);
+            cfs_part_add(w, (uint64_t)(seed % (8u << 20)) + (1u << 20),
+                         1u << 20, 0x83, NULL, 0);
+        }
+
         uint64_t bsz = cfs_block_size(w);
         if (bsz && bsz <= (2u << 20)) {
             size_t bl = plen < 4096 ? plen : 4096;

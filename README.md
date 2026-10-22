@@ -31,6 +31,8 @@ make                       # 产出 cfs-tool / cfs-fuse / cfs_block_hook.so / cf
 
 aarch64 与 x86-64 都用 `-Wall -O3` 构建，零警告。x86 上默认 `-march=x86-64-v2`（标量解码）；AVX2 内核需要 `make ARCHFLAGS=-march=x86-64-v3`。
 
+AVX2 内核（`cpenc_avx2.h`）在 x86 真机上实测：core 级 **3.44x**（1MB 组、nz=16、4bit/符号，800 → 2754 MB/s，`make test/avx2_lut_check` 会打印这个数字），但**端到端几乎不体现**——真实数据的分块 100% 落在 REF2/SEG 上，时间花在引用拷贝而不是 LUT 展开（94MB tar：524 → 529 MB/s）。它是为 LUT 型块准备的，不是通用加速。
+
 ## 快速开始
 
 ### 存文件
