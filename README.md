@@ -227,8 +227,8 @@ requires an external tool.
 GNU General Public License v3.0 (`LICENSE`), plus one **section 7(b)
 additional term** (`NOTICE`):
 
-> The copyright notice and the name "JXLAB" must be preserved with the
-> program; a derived work must keep "JXLAB" in its appropriate legal notices,
+> The copyright notice and the name "JX-LAB-ORG" must be preserved with the
+> program; a derived work must keep "JX-LAB-ORG" in its appropriate legal notices,
 > alongside the notices for its own changes.
 
 GPLv3 section 10 forbids adding further restrictions, but section 7(b)
