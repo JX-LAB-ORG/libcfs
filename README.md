@@ -121,7 +121,7 @@ CFS_MODE_DEDUP=3   blocks[] 存引用表而不是内容
 ## 测试
 
 ```sh
-make test       # 10 套件
+make test       # 11 套件
 make stress     # 随机写 / 块上限回退 / 分区循环
 make testall    # test + cfs-tool 冒烟 + ext4/exfat fsck 验收 + 块设备 hook 测试
 make fuzz       # 容器模糊测试（需 clang + compiler-rt）
@@ -148,8 +148,13 @@ make fuzz       # 容器模糊测试（需 clang + compiler-rt）
 ## 已知边界
 
 - 设备枚举：preload 做不到（见上）。
-- `verify` 不修复，也没有 `fsck` 那样的交互修复流程。
-- **没有模糊测试**：格式解析对畸形输入的安全性还没有证据。
+- `verify` 不修复，也没有 `fsck` 那样的交互修复流程。它能查结构、能重解码，
+  但**发现不了"解出来和原来不一样"**的静默损坏（编码端曾经把大写十六进制改坏
+  就是这一类）；那类问题只能靠留原件比对。
 - 合并层的 GC 阈值（`CFS_DEDUP_FRAG_MAX` / `CFS_DEDUP_DEAD_MAX`）是实测调出来的经验值，没有理论推导。
 - `compact` 需要临时双倍宿主空间（它同时持有容器和重建副本），配额下会拒绝。
-- 真实磁盘镜像上 cpenc 与 xz/zstd 的正面对比**还没有测**——这是产品定位上唯一还缺的大数字。
+- 模糊测试覆盖**能自动喂的两层**：cpenc 的块编解码（畸形输入 + 编码往返两个靶子）
+  和容器/分区解析及写路径。挂载层（FUSE、preload 的 syscall 拦截）不在靶子里——
+  它们是独立进程边界，目前靠单测覆盖其中的路径逻辑。跑法见上面的测试一节。
+- 真实磁盘镜像上 cpenc 与 xz/zstd/gzip/lz4 的正面对比已测（673MB ext4 镜像，
+  3.68×，压缩 4.29 MB/s、解压 164 MB/s），复现脚本在 `libcpool/test/bench_image.sh`。
