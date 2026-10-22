@@ -154,6 +154,9 @@ testall: test cfs-tool cfs_preload.so cfs_block_hook.so
 	cc $(CFLAGS) test/iso_gen.c test/iso_mk.o -o test/iso_gen
 	chmod +x test/cfs_ext4_fsck_test.sh
 	./test/cfs_ext4_fsck_test.sh
+	@echo "=== exfat fsck/mount acceptance ==="
+	chmod +x test/cfs_exfat_fsck_test.sh
+	./test/cfs_exfat_fsck_test.sh
 	@echo "=== block hook test ==="
 	cc $(CFLAGS) test/vblk_probe.c -o test/vblk_probe
 	chmod +x test/cfs_block_hook_test.sh

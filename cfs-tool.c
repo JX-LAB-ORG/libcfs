@@ -393,7 +393,7 @@ int main(int argc, char *argv[]) {
          * Self-contained: writes fs structures directly, no external tools. */
         if (argc < 4) {
             fprintf(stderr, "Usage: %s mkfs <fstype> <size> <out.cfs> [-p <n>] [-g]\n", argv[0]);
-            fprintf(stderr, "  fstype: ext4 | fat32 | swap\n");
+            fprintf(stderr, "  fstype: ext4 | fat32 | exfat | swap\n");
             fprintf(stderr, "  size:   100M, 1G, 10G, etc.\n");
             fprintf(stderr, "  -p <n>: format inside partition n (creates MBR + partition 1)\n");
             fprintf(stderr, "  -g:     use GPT instead of MBR (with -p)\n");
