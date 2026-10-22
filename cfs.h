@@ -9,6 +9,12 @@
 extern "C" {
 #endif
 
+/* ─── Versions ─────────────────────────────────────────────── */
+/* The release this source tree is.  Kept apart from CFS_VERSION, which is
+ * the on-disk container format: the code can move without the format
+ * moving, and vice versa, so a bug report has to be able to name both. */
+#define CFS_TOOL_VERSION "0.1.0"
+
 /* ─── Flags ────────────────────────────────────────────────── */
 #define CFS_RDONLY  0x01
 #define CFS_RDWR    0x02

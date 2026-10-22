@@ -1,0 +1,53 @@
+libcfs / libcpool
+Copyright (C) 2026 JX-LAB
+
+This program is free software: you can redistribute it and/or modify it
+under the terms of the GNU General Public License as published by the Free
+Software Foundation, version 3 of the License.
+
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+more details.
+
+You should have received a copy of the GNU General Public License along with
+this program (see LICENSE).  If not, see <https://www.gnu.org/licenses/>.
+
+
+Additional terms under GNU GPL version 3, section 7(b)
+======================================================
+
+Section 7 of the GNU GPL version 3 allows a licensor to add certain terms,
+including (b) "requiring preservation of specified reasonable legal notices
+or author attributions in that material or in the Appropriate Legal Notices
+displayed by works containing it".  The following additional term is added
+under that provision, and only that provision:
+
+  1. The copyright notice above and this NOTICE file must be preserved in
+     every copy of the Program, and in every modified version of it.
+
+  2. The name "JX-LAB" must appear in the Appropriate Legal Notices of any
+     work that contains or is derived from the Program, alongside the
+     notices for whatever was changed.
+
+  3. A modified version may not be presented as if it were the original
+     work of JX-LAB, nor may the origin of the material be misrepresented.
+
+This term grants no permission and removes none: every right to use, study,
+modify and redistribute the Program is exactly what the GNU GPL version 3
+gives you.  It only requires that the attribution travels with the work.
+It is not an "additional restriction" within the meaning of section 10 —
+it is the kind of term section 7(b) expressly permits — so it is not one of
+the terms a recipient may strip under section 7's second paragraph.
+
+What this means in practice:
+
+  - Using the library, including in a commercial product: unchanged, no
+    obligation beyond the GPL itself.
+  - Redistributing it, modified or not: keep the copyright line and this
+    file, and keep "JX-LAB" visible where the work states its licensing or
+    credits.
+  - Forking it: add your own notice for your changes; do not remove ours.
+
+If the name "JX-LAB" is to be used as a trademark for a distribution, that
+is a separate question from this license and is not granted here.

@@ -158,3 +158,14 @@ make fuzz       # 容器模糊测试（需 clang + compiler-rt）
   它们是独立进程边界，目前靠单测覆盖其中的路径逻辑。跑法见上面的测试一节。
 - 真实磁盘镜像上 cpenc 与 xz/zstd/gzip/lz4 的正面对比已测（673MB ext4 镜像，
   3.68×，压缩 4.29 MB/s、解压 164 MB/s），复现脚本在 `libcpool/test/bench_image.sh`。
+
+## 许可
+
+GNU General Public License v3.0（`LICENSE`），并附一条 **§7(b) 附加条款**（`NOTICE`）：
+
+> 版权声明与 "JX-LAB" 署名必须随程序保留；二开时在自己的修改声明之外，还要在
+> 适当法律声明处保留 "JX-LAB"。
+
+GPLv3 §10 不允许再加限制，但 §7(b) 明确允许"要求保留作者署名"这一类条款，所以
+它写成了 §7(b) 附加条款而不是额外授权条件——否则会被判为 further restriction
+而无效。这条只加"署名要跟着走"，不改变 GPL 授予的任何权利。

@@ -1,5 +1,7 @@
 #define _GNU_SOURCE
 #include "cfs.h"
+#include "cfs_format.h" /* CFS_VERSION: the on-disk container format */
+#include "cpenc.h"      /* CPENC_VERSION, for --version */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,6 +20,7 @@ static const char *cpath(const char *p) {
 
 static void usage(const char *prog) {    fprintf(stderr,
         "Usage: %s <command> [args...]\n"
+        "       %s --version\n"
         "\n"
         "Commands:\n"
         "  mount  <cfs>        [mount_pt]   Mount .cfs and spawn shell\n"
@@ -64,7 +67,7 @@ static void usage(const char *prog) {    fprintf(stderr,
         "  partlist <cfs>                  Print partition table\n"
         "  partwrite <cfs> <n> <src>       Write file into partition\n"
         "\n",
-        prog);
+        prog, prog);
 }
 
 /* ── partition helpers ─────────────────────────────────────────── */
@@ -161,6 +164,15 @@ int main(int argc, char *argv[]) {
     if (argc < 2) { usage(argv[0]); return 1; }
 
     const char *cmd = argv[1];
+
+    /* Two versions matter and they are not the same number: the tool can be
+     * upgraded without the on-disk format moving, and a bug report that
+     * names only one of them is ambiguous. */
+    if (!strcmp(cmd, "--version") || !strcmp(cmd, "-V")) {
+        printf("cfs-tool %s (container format %d, block codec %d)\n",
+               CFS_TOOL_VERSION, CFS_VERSION, CPENC_VERSION);
+        return 0;
+    }
 
     if (!strcmp(cmd, "pack")) {
         if (argc < 4) { usage(argv[0]); return 1; }
