@@ -110,7 +110,9 @@ export CFS_BLOCK_DEV=/dev/vda CFS_BLOCK_FILE="$Q" CFS_BLOCK_PARTS=1
 export CFS_MAX_PHYSICAL=$LIMIT
 ok=0; i=0
 while [ $i -lt 200 ]; do
-    if ./test/vblk_probe /dev/vda writerand $((i * 262144)) 262144 | grep -q '^ok$'; then
+    # grep inherits the hook too, and its constructor wants the same
+    # exclusive lock the probe is holding; keep it out of the way.
+    if ./test/vblk_probe /dev/vda writerand $((i * 262144)) 262144 | env -u LD_PRELOAD grep -q '^ok$'; then
         ok=$((ok + 1)); i=$((i + 1))
     else
         break
