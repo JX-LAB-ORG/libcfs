@@ -1,7 +1,7 @@
 #define _GNU_SOURCE
 #include "cfs.h"
-#include "cfs_format.h" /* CFS_VERSION: the on-disk container format */
-#include "cpenc.h"      /* CPENC_VERSION, for --version */
+#include "cfs_format.h"          /* CFS_VERSION: the on-disk container format */
+#include "../libcpool/cpenc.h"   /* CPENC_VERSION, for --version */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
