@@ -22,3 +22,5 @@ test/iso_gen
 .mountwork
 test/fuzz_cfs
 test/fuzz_cpenc
+test/bench_gen
+test/bench_tables
