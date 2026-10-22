@@ -124,6 +124,17 @@ int main(int argc, char **argv) {
          * the new partition must be invisible, then BLKRRPART must reveal it. */
         int fd = open(dev, O_RDONLY);
         if (fd < 0) { printf("open-fail\n"); return 0; }
+        /* Tell the caller the device is held, so the external writer it is
+         * about to start cannot race us: a fixed sleep on the writer's side
+         * guessed how long this process takes to open, and on a loaded
+         * machine the guess loses — the writer grabbed the lock first and
+         * this open failed, which the test could only report as "open-fail"
+         * rather than the refusal it was checking for. */
+        const char *ready = getenv("CFS_PROBE_READY");
+        if (ready) {
+            int rf = open(ready, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (rf >= 0) close(rf);
+        }
         uint64_t sz;
         if (ioctl(fd, BLKGETSIZE64, &sz)) { printf("ioctl-fail\n"); return 0; }
         usleep(900 * 1000);

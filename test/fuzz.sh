@@ -32,6 +32,13 @@ if [ -z "$(ls -A "$CORPUS" 2>/dev/null)" ]; then
     rm -rf "$W"
 fi
 
+# Regression seeds: inputs that once ran this process out of memory.  They are
+# tiny, and keeping them in the corpus means every run re-exercises the shapes
+# that found the allocation bugs.
+for s in test/fuzz_seeds/*.seed; do
+    [ -e "$s" ] && cp "$s" "$CORPUS/" 2>/dev/null
+done
+
 clang -fsanitize=fuzzer,undefined -fno-sanitize-recover=all -O1 -g -I. -I.. \
       test/fuzz_cfs.c cfs.c cfs_dedup.c cfs_part.c cfs_verify.c \
       ../libcpool/cpenc.c ../libcpool/bwt.c -lm -o test/fuzz_cfs || exit 1

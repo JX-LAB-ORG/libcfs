@@ -40,9 +40,12 @@ echo "[h2] the container takes one writer at a time"
 # container takes an advisory lock, so a second writer is refused outright
 # rather than allowed to corrupt a table another handle is mid-way through.
 # The guarantee is the refusal, so that is what gets checked.
-( sleep 0.3; env -u LD_PRELOAD ./cfs-tool partadd "$T/d.cfs" linux 98304 114687 >/dev/null 2>&1; \
+rm -f "$T/ready"
+( n=0
+  while [ ! -e "$T/ready" ] && [ "$n" -lt 200 ]; do sleep 0.05; n=$((n+1)); done
+  env -u LD_PRELOAD ./cfs-tool partadd "$T/d.cfs" linux 98304 114687 >/dev/null 2>&1; \
   echo $? > "$T/ext.rc" ) &
-ck "$(./test/vblk_probe /dev/vda stalecheck 3 /dev/vda3)" "still-fail" "external writer refused while the device is open"
+ck "$(CFS_PROBE_READY="$T/ready" ./test/vblk_probe /dev/vda stalecheck 3 /dev/vda3)" "still-fail" "external writer refused while the device is open"
 wait
 ck "$([ "$(cat "$T/ext.rc" 2>/dev/null)" != "0" ] && echo refused || echo allowed)" \
    "refused" "cfs-tool partadd exits non-zero against an open container"
