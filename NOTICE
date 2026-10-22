@@ -1,5 +1,5 @@
 libcfs / libcpool
-Copyright (C) 2026 JX-LAB
+Copyright (C) 2026 JXLAB
 
 This program is free software: you can redistribute it and/or modify it
 under the terms of the GNU General Public License as published by the Free
@@ -26,12 +26,12 @@ under that provision, and only that provision:
   1. The copyright notice above and this NOTICE file must be preserved in
      every copy of the Program, and in every modified version of it.
 
-  2. The name "JX-LAB" must appear in the Appropriate Legal Notices of any
+  2. The name "JXLAB" must appear in the Appropriate Legal Notices of any
      work that contains or is derived from the Program, alongside the
      notices for whatever was changed.
 
   3. A modified version may not be presented as if it were the original
-     work of JX-LAB, nor may the origin of the material be misrepresented.
+     work of JXLAB, nor may the origin of the material be misrepresented.
 
 This term grants no permission and removes none: every right to use, study,
 modify and redistribute the Program is exactly what the GNU GPL version 3
@@ -45,9 +45,9 @@ What this means in practice:
   - Using the library, including in a commercial product: unchanged, no
     obligation beyond the GPL itself.
   - Redistributing it, modified or not: keep the copyright line and this
-    file, and keep "JX-LAB" visible where the work states its licensing or
+    file, and keep "JXLAB" visible where the work states its licensing or
     credits.
   - Forking it: add your own notice for your changes; do not remove ours.
 
-If the name "JX-LAB" is to be used as a trademark for a distribution, that
+If the name "JXLAB" is to be used as a trademark for a distribution, that
 is a separate question from this license and is not granted here.
