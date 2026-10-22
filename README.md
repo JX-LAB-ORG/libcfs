@@ -1,7 +1,7 @@
-# libcfs
+# libcfs — the Container File System (CFS)
 
-> A compressed store: a whole filesystem or disk image inside one container
-> that can be deduplicated, mounted, and given a security boundary.
+> One file holding a whole filesystem or disk image: compressed, deduplicated,
+> mountable, and with a security boundary around whatever runs inside it.
 
 ## What it is
 
