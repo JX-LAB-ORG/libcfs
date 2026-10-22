@@ -123,10 +123,11 @@ CFS_MODE_DEDUP=3   blocks[] 存引用表而不是内容
 ```sh
 make test       # 10 套件
 make stress     # 随机写 / 块上限回退 / 分区循环
-make testall    # test + cfs-tool 冒烟 + ext4 fsck 验收 + 块设备 hook 测试
+make testall    # test + cfs-tool 冒烟 + ext4/exfat fsck 验收 + 块设备 hook 测试
+make fuzz       # 容器模糊测试（需 clang + compiler-rt）
 ```
 
-验收尽量**用外部工具判定**，而不是自证：`e2fsck -fn`、`fsck.vfat`、真机 loop 挂载、块设备 hook 的 33 项探针。项目里自己写的 `verify` 只证明"容器自洽"，证明不了"内容正确"——那件事只能靠外部工具。
+验收尽量**用外部工具判定**，而不是自证：`e2fsck -fn`、`fsck.exfat -n`、真机 loop 挂载、块设备 hook 的 33 项探针。没有对应工具的机器上，两项 fsck 验收会打印 `SKIP` 并说明原因，不会假装通过；跑巨大的 1G 用例需要 ~1.1G 临时空间，可用 `TMPDIR` 或 `CFS_FSCK_WORK` 指定（`/tmp` 常是小 tmpfs）。项目里自己写的 `verify` 只证明"容器自洽"，证明不了"内容正确"——那件事只能靠外部工具。
 
 ## 文件组成
 
