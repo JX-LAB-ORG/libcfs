@@ -41,9 +41,15 @@ echo "[h2] the container takes one writer at a time"
 # rather than allowed to corrupt a table another handle is mid-way through.
 # The guarantee is the refusal, so that is what gets checked.
 rm -f "$T/ready"
-( n=0
+# The hook is exported, so every child this subshell starts would load it too
+# — and its constructor opens the container exclusively.  A `sleep` polling
+# for the probe's ready file therefore takes the very lock the probe is
+# trying to acquire, and the probe reports open-fail.  Drop the hook for the
+# whole subshell (this is where `env -u LD_PRELOAD sleep 0.3` used to break).
+( unset LD_PRELOAD
+  n=0
   while [ ! -e "$T/ready" ] && [ "$n" -lt 200 ]; do sleep 0.05; n=$((n+1)); done
-  env -u LD_PRELOAD ./cfs-tool partadd "$T/d.cfs" linux 98304 114687 >/dev/null 2>&1; \
+  ./cfs-tool partadd "$T/d.cfs" linux 98304 114687 >/dev/null 2>&1; \
   echo $? > "$T/ext.rc" ) &
 ck "$(CFS_PROBE_READY="$T/ready" ./test/vblk_probe /dev/vda stalecheck 3 /dev/vda3)" "still-fail" "external writer refused while the device is open"
 wait
