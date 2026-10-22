@@ -1,5 +1,8 @@
 # libcfs — the Container File System (CFS)
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23572189.svg)](https://doi.org/10.5281/zenodo.23572189)
+![license](https://img.shields.io/badge/license-GPL--3.0--only-blue)
+
 > One file holding a whole filesystem or disk image: compressed, deduplicated,
 > mountable, and with a security boundary around whatever runs inside it.
 
