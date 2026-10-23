@@ -12,12 +12,11 @@
 - **Container**: superblock + inode table + CPEnc-compressed blocks. Ordinary
   files are split at 64MB; the `@block` virtual block device splits at 8MB,
   which caps the decompress-modify-recompress cost of a random write.
-- **Two layers of metadata.** A file stored directly in the container carries
-  its type, size and mtime; the v2 inode has no POSIX permission bits and no
-  uid/gid (`cfs_chown` is a documented no-op). Anything that needs full
-  attributes belongs in a formatted partition inside `@block`, where the
-  inner filesystem — ext4, fat32, exfat, or whatever you write with an
-  external tool — owns them.
+- **The container is a virtual disk.** `@block` carries a standard partition
+  table; format it with the built-in formatters or any external tool and the
+  filesystem inside owns permissions, ownership and timestamps. Files stored
+  in the container's own namespace (`pack`) carry type, size and mtime only
+  — that namespace is the tool's storage, not a POSIX filesystem.
 - **`@block` virtual block device**: a reserved entry carrying a standard
   MBR/GPT partition table. Sparse (unwritten regions read as zero), and it
   declares its own drive identity (SSD / HDD / USB / SD) at creation time.
