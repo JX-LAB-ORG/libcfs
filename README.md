@@ -40,10 +40,15 @@ This section matters more than the one above:
   advantage is speed: 4–20x faster to compress than zstd-19 / xz / brotli.
   Decompression runs at 82–371 MB/s — about 2.5x xz, 1.1–3.4x slower than
   zstd.
-- **No `lsblk`-style device enumeration.** `LD_PRELOAD` can serve ioctls and
-  can answer reads of `/sys/block/*/queue/*`, but it cannot fake a complete
-  device enumeration. Enumerating needs a real mount, or virt-kernel's device
-  model.
+- **`lsblk`-style enumeration is limited to dynamically-linked programs.**
+  The `LD_PRELOAD` hook serves ioctls today; faking the `/sys` view needs
+  opendir/readdir/stat synthesis (not implemented yet). Static binaries,
+  setuid programs and raw-syscall users bypass any preload by construction.
+  Running the software as a guest on a virtual platform sidesteps the
+  problem entirely — that is the separate virt-kernel project, whose device
+  model is part of the platform and which relies on cfs images for its disks
+  (it is how a standard OS install completes).  It is a different product,
+  not a fallback for this hook.
 - **No NTFS or XFS formatter.** Pre-format with an external tool and write it
   into `@block` byte for byte (verified to work transparently).
 - **Not for text archives.** On text, xz -9 (6.77x whole-file, 5.99x with
