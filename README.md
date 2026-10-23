@@ -16,7 +16,8 @@
   table; format it with the built-in formatters or any external tool and the
   filesystem inside owns permissions, ownership and timestamps. Files stored
   in the container's own namespace (`pack`) carry type, size and mtime only
-  — that namespace is the tool's storage, not a POSIX filesystem.
+  — that namespace is the tool's storage, not a POSIX filesystem, and it has
+  no chmod/chown (the hook returns ENOTSUP for those paths).
 - **`@block` virtual block device**: a reserved entry carrying a standard
   MBR/GPT partition table. Sparse (unwritten regions read as zero), and it
   declares its own drive identity (SSD / HDD / USB / SD) at creation time.

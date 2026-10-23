@@ -72,8 +72,6 @@ extern int      cfs_symlink(CFS *c, const char *t, const char *l);
 extern ssize_t  cfs_readlink(CFS *c, const char *p, char *b, size_t s);
 extern int      cfs_rename(CFS *c, const char *o, const char *n);
 extern int      cfs_utimens(CFS *c, const char *p, uint64_t a, uint64_t m);
-extern int      cfs_chmod(CFS *c, const char *p, uint16_t m);
-extern int      cfs_chown(CFS *c, const char *p, uint32_t u, uint32_t g);
 extern void     cfs_close(CFS *c);
 
 /* ─── State ─────────────────────────────────────────────────────── */
@@ -1116,14 +1114,14 @@ int mkdirat(int d, const char *p, mode_t m) {
 
 int chmod(const char *p, mode_t m) {
     char rel[256];
-    if (resolve(p, rel, sizeof(rel))) return cfs_chmod(cfs, rel, (uint16_t)m);
+    if (resolve(p, rel, sizeof(rel))) { errno = ENOTSUP; return -1; }  /* namespace has no permission bits */
     static int (*_chm)(const char*, mode_t);
     LOAD(_chm, "chmod");
     return _chm(p, m);
 }
 int fchmod(int fd, mode_t m) {
     VFile *v = vfd_get(fd);
-    if (v) return 0; /* accept, metadata not persisted in v2 */
+    if (v) { errno = ENOTSUP; return -1; }   /* no permission bits in the namespace */
     static int (*_fchm)(int, mode_t);
     LOAD(_fchm, "fchmod");
     return _fchm(fd, m);
@@ -1135,14 +1133,14 @@ int fchmod(int fd, mode_t m) {
 
 int chown(const char *p, uid_t u, gid_t g) {
     char rel[256];
-    if (resolve(p, rel, sizeof(rel))) return cfs_chown(cfs, rel, u, g);
+    if (resolve(p, rel, sizeof(rel))) { errno = ENOTSUP; return -1; }  /* namespace has no ownership */
     static int (*_cho)(const char*, uid_t, gid_t);
     LOAD(_cho, "chown");
     return _cho(p, u, g);
 }
 int fchown(int fd, uid_t u, gid_t g) {
     VFile *v = vfd_get(fd);
-    if (v) return 0;
+    if (v) { errno = ENOTSUP; return -1; }   /* no ownership in the namespace */
     static int (*_fcho)(int, uid_t, gid_t);
     LOAD(_fcho, "fchown");
     return _fcho(fd, u, g);

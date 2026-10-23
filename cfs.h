@@ -61,8 +61,6 @@ int    cfs_rename(CFS *cfs, const char *oldpath, const char *newpath);
 
 /* ─── Utimens / Chmod / Chown ───────────────────────────────── */
 int    cfs_utimens(CFS *cfs, const char *path, uint64_t atime, uint64_t mtime);
-int    cfs_chmod(CFS *cfs, const char *path, uint16_t perm);
-int    cfs_chown(CFS *cfs, const char *path, uint32_t uid, uint32_t gid);
 
 /* ─── Compact / Unpack ─────────────────────────────────────── */
 int    cfs_compact(CFS *cfs);

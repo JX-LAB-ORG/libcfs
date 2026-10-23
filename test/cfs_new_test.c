@@ -120,13 +120,11 @@ int main(void) {
     T(cfs_stat(c, "newname.txt", &st) == 0, "stat after utimens");
     T(st.mtime == 1718490000, "mtime updated");
 
-    /* chmod/chown should succeed (v2 persisting implicitly) */
-    T(cfs_chmod(c, "newname.txt", 0644) == 0, "chmod 0644");
-    T(cfs_chown(c, "newname.txt", 1000, 1000) == 0, "chown 1000:1000");
+    /* chmod/chown are not part of the container namespace: the API does
+     * not exist, and the hook refuses with ENOTSUP. */
 
     /* Non-existing path */
     T(cfs_utimens(c, "noexist", 0, 0) == -1, "utimens nonoexist");
-    T(cfs_chmod(c, "noexist", 0755) == -1, "chmod nonoexist");
 
     cfs_close(c);
 

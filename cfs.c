@@ -984,24 +984,6 @@ int cfs_utimens(CFS *c, const char *path, uint64_t atime, uint64_t mtime) {
     return cfs_sync(c);
 }
 
-/* ── chmod ──────────────────────────────────────────────────── */
-int cfs_chmod(CFS *c, const char *path, uint16_t perm) {
-    (void)perm;
-    if (!c || !(c->flags & CFS_RDWR) || !path) return -1;
-    if (!lu(c, path)) { errno = ENOENT; return -1; }
-    /* v2 format: no per-inode perm field — accept and persist implicitly */
-    return 0;
-}
-
-/* ── chown ──────────────────────────────────────────────────── */
-int cfs_chown(CFS *c, const char *path, uint32_t uid, uint32_t gid) {
-    (void)uid; (void)gid;
-    if (!c || !(c->flags & CFS_RDWR) || !path) return -1;
-    if (!lu(c, path)) { errno = ENOENT; return -1; }
-    /* v2 format: no per-inode uid/gid — accept and persist implicitly */
-    return 0;
-}
-
 /* ═══════════════════════════════════════════════════════════════════
    cfs_compact — reclaim orphaned blocks by rewriting active data
    sequentially into a temporary file, then atomically rename.
