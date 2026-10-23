@@ -148,6 +148,15 @@ child process writes to its real stdout and a builtin's buffered output is
 flushed after the redirection is restored.  Use FUSE or the library API when
 writes matter; `test/preload_probe.c` is the way to test the hook.
 
+The hook takes the container's exclusive lock when a process first **resolves a
+container path**, not when it starts.  A shell forks and execs both sides of a
+pipeline together, and a process that never touches the mount — the `tr` in
+`cat "$M/f" | tr -d " "` — must not take the lock from the process that does.
+Processes that inherit `CFS_MOUNT_TREE` naming the same file are inside a tree
+that already holds it and never take it themselves; the tree is one logical
+client.  The mount's directory tree is created at that same first use, so a
+path the process resolves is real by the time the kernel sees it.
+
 ## Commands
 
 | Command | Purpose |

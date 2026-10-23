@@ -196,6 +196,11 @@ typedef struct {
 
 /* ─── Lifecycle ────────────────────────────────────────────── */
 CFS   *cfs_open(const char *path, int flags);
+/* Take the exclusive lock on a handle opened with CFS_NO_LOCK set.  errno is
+ * EBUSY when another process holds it.  The preload hook defers its lock to
+ * the first container path it resolves, so that a process which merely shares
+ * a shell pipeline with a mount client never takes the lock at all. */
+int    cfs_lock_now(CFS *cfs);   /* 0 = locked, -1 = EBUSY / invalid */
 void   cfs_close(CFS *cfs);
 
 /* ─── Read (auto-decompress) ───────────────────────────────── */

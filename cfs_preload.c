@@ -60,6 +60,7 @@ typedef struct {
 
 struct _cfs; typedef struct _cfs CFS;
 extern CFS     *cfs_open(const char *p, int f);
+extern int      cfs_lock_now(CFS *c);
 extern void    *cfs_read_all(CFS *c, const char *p, size_t *o);
 extern ssize_t  cfs_read(CFS *c, const char *p, void *b, size_t s, off_t o);
 extern int      cfs_write(CFS *c, const char *p, const void *b, size_t s);
@@ -78,6 +79,10 @@ extern void     cfs_close(CFS *c);
 static char cfs_mount[512];
 static char cfs_path[512];
 static CFS *cfs;
+static int  cfs_locked;   /* this process holds the exclusive lock */
+static int  cfs_member;   /* this process is inside a tree that holds it */
+static int  cfs_ready;    /* directories materialised, lock settled */
+static int  cfs_warned;   /* the contention message is printed once */
 
 /* ─── Virtual fd table ──────────────────────────────────────────── */
 #define MAX_VFD 1024
@@ -115,6 +120,7 @@ static FILE*     (*_fopen)(const char*, const char*);
 static FILE*     (*_fdopen)(int, const char*);
 static FILE*     (*_fmemopen)(void*, size_t, const char*);
 static int       (*_fclose)(FILE*);
+static int       (*_chdir)(const char*);
 
 /* Track fmemopen buffers so we can free on fclose */
 #define MAX_FMEM 64
@@ -151,40 +157,86 @@ __attribute__((constructor)) static void _init(void) {
     _mm  = (typeof(_mm))  dlsym(RTLD_NEXT, "mmap");
     _mu  = (typeof(_mu))  dlsym(RTLD_NEXT, "munmap");
     _rv  = (typeof(_rv))  dlsym(RTLD_NEXT, "readv");
+    _chdir = (typeof(_chdir)) dlsym(RTLD_NEXT, "chdir");
 
     const char *m = getenv("CFS_MOUNT"), *f = getenv("CFS_FILE");
     if (!m || !f) return;
     strncpy(cfs_mount, m, 511); cfs_mount[511] = 0;
     strncpy(cfs_path, f, 511);  cfs_path[511] = 0;
-    cfs = cfs_open(f, CFS_RDWR | CFS_RAW);
-    if (!cfs) {
-        /* The mount is a process tree, not a process: every child re-opens
-         * the container, and the first one holds the exclusive lock.  So
-         * `sh -c 'cd /mnt; ls'` mounted in the shell and came up empty in
-         * ls, which reported FAILED and went on to serve host paths.  The
-         * tree is one logical client — membership is passed down through
-         * the environment, and only a process that mounted the same file
-         * skips the lock.  Any handle outside the tree still takes it, so
-         * an external writer is refused exactly as before. */
-        const char *tree = getenv("CFS_MOUNT_TREE");
-        if (tree && !strcmp(tree, f)) {
-            const char *prev = getenv("CFS_NO_LOCK");
-            char keep[8];
-            snprintf(keep, sizeof keep, "%s", prev ? prev : "");
-            setenv("CFS_NO_LOCK", "1", 1);
+    /* Open the container without the lock.  The exclusive lock is taken on
+     * the first path this process actually resolves (ensure_lock below), not
+     * here, because a shell execs the two sides of a pipeline together:
+     * `cat "$M/f" | tr -d ' '` forks both, and if tr -- which never touches
+     * the container -- wins the lock, cat fails it, falls through to the host
+     * filesystem and serves the wrong bytes.  Nothing here touches a
+     * container path, so nothing here has to hold the lock.
+     *
+     * The mount is a process tree, not a process: membership still comes down
+     * through the environment, and a process that inherits CFS_MOUNT_TREE for
+     * the file it was started on never takes the lock — the tree is one
+     * logical client.  A handle outside the tree still takes it, so an
+     * external writer is refused exactly as before. */
+    const char *tree = getenv("CFS_MOUNT_TREE");
+    if (tree && !strcmp(tree, f)) cfs_member = 1;
+    {
+        const char *prev = getenv("CFS_NO_LOCK");
+        char keep[8];
+        snprintf(keep, sizeof keep, "%s", prev ? prev : "");
+        setenv("CFS_NO_LOCK", "1", 1);
+        /* Opening unlocked means the table can be read while its owner is
+         * halfway through a sync, which fails validation rather than tearing
+         * silently.  Wait for the writer instead: 100ms covers a sync of the
+         * sizes this format is used for, and a container that is merely
+         * absent is not worth waiting for at all. */
+        for (int i = 0; i < 50; i++) {
             cfs = cfs_open(f, CFS_RDWR | CFS_RAW);
-            if (prev) setenv("CFS_NO_LOCK", keep, 1);
-            else      unsetenv("CFS_NO_LOCK");
+            if (cfs || errno == ENOENT) break;
+            usleep(2000);
         }
+        if (prev) setenv("CFS_NO_LOCK", keep, 1);
+        else      unsetenv("CFS_NO_LOCK");
     }
-    if (cfs) setenv("CFS_MOUNT_TREE", f, 1);
     memset(vfds, 0, sizeof(vfds));
-    if (cfs) {
-        /* Pre-create all cfs directories so chdir works immediately */
-        cfs_mkdir_p(m, "");  /* mkdir_p is defined below */
-        fprintf(stderr, "[cfs] mounted %s at %s\n", f, m);
-    } else
-        fprintf(stderr, "[cfs] FAILED to open %s\n", f);
+    if (cfs) fprintf(stderr, "[cfs] mounted %s at %s\n", f, m);
+    else     fprintf(stderr, "[cfs] FAILED to open %s\n", f);
+}
+
+/* Settle the lock and materialise the directory tree, once, on the first
+ * container path this process touches.  A member of a tree never takes the
+ * lock — the process that mounted the file holds it — but still needs the
+ * directories under the mount point to exist for the kernel to path into.
+ * Returns 0 when the container may be used. */
+static void cfs_after_lock(void);
+
+static int ensure_lock(void) {
+    if (!cfs) return 0;
+    if (cfs_locked || cfs_member) {
+        if (!cfs_ready) cfs_after_lock();
+        return cfs != NULL;
+    }
+    for (int i = 0; i < 200; i++) {      /* 200 x 2ms = 400ms */
+        if (cfs_lock_now(cfs) == 0) {
+            cfs_locked = 1;
+            setenv("CFS_MOUNT_TREE", cfs_path, 1);
+            cfs_after_lock();
+            return cfs != NULL;
+        }
+        if (errno != EBUSY) break;
+        usleep(2000);   /* the holder is usually a sibling finishing up */
+    }
+    /* Falling through to the host filesystem silently would serve bytes from
+     * the wrong tree; say why the container is not being served instead. */
+    if (!cfs_warned) {
+        cfs_warned = 1;
+        fprintf(stderr, "[cfs] %s is locked by another process: %s\n",
+                cfs_path, strerror(errno));
+    }
+    return 0;
+}
+
+static void cfs_after_lock(void) {
+    cfs_ready = 1;
+    if (cfs) cfs_mkdir_p(cfs_mount, "");   /* so chdir works immediately */
 }
 
 /* Recursively create real directories for all cfs dirs under `prefix`.
@@ -255,7 +307,7 @@ static int is_cfs_dir(const char *rel) {
  * input, it is the part worth testing, and keeping it free of the
  * interposed symbols lets a test call it directly. */
 static int resolve(const char *p, char *out, size_t n) {
-    if (!p || !cfs) return 0;
+    if (!p || !cfs || !ensure_lock()) return 0;
     char cwd[512];
     const char *c = NULL;
     if (p[0] != '/') {
@@ -821,6 +873,18 @@ static void my_dir_reg(my_DIR *d) {
 }
 static void my_dir_unreg(my_DIR *d) {
     for (int i = 0; i < MAX_MYDIR; i++) if (my_dirs[i] == d) { my_dirs[i] = NULL; return; }
+}
+
+/* chdir is not a container operation by itself, but the kernel can only enter
+ * a real directory, and the tree under the mount point is materialised lazily
+ * (ensure_real_dir).  Resolving here creates it before the kernel looks, so
+ * `cd` into a directory this process has not touched yet still works after
+ * the constructor stopped pre-creating every directory. */
+int chdir(const char *p) {
+    char rel[256];
+    if (p) resolve(p, rel, sizeof rel);
+    LOAD(_chdir, "chdir");
+    return _chdir ? _chdir(p) : -1;
 }
 
 DIR *opendir(const char *name) {

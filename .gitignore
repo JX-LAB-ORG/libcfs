@@ -24,3 +24,5 @@ test/fuzz_cfs
 test/fuzz_cpenc
 test/bench_gen
 test/bench_tables
+test/cfs_dedup_writepath_test
+test/preload_probe

@@ -436,6 +436,13 @@ fail:
     close(c->fd); free(c); return NULL;
 }
 
+int cfs_lock_now(CFS *c) {
+    if (!c || !(c->flags & CFS_RDWR)) { errno = EINVAL; return -1; }
+    if (c->locked) return 0;
+    if (cfs_lock(c) != 0) { errno = EBUSY; return -1; }
+    return 0;
+}
+
 void cfs_close(CFS *c) {
     if (!c) return;
     if ((c->flags & CFS_RDWR) && (c->pend_n || c->dt_dirty || c->dirty)) cfs_sync(c);
