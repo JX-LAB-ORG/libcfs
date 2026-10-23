@@ -140,6 +140,14 @@ LD_PRELOAD=./cfs_block_hook.so CFS_BLOCK_FILE=disk.cfs CFS_BLOCK_DEV=/dev/vda \
 `chdir`s to the mount point and spawns a shell that already has `LD_PRELOAD`
 set.
 
+The preload **file** hook (`cfs_preload.so`) serves whole-file reads and
+writes through `open`/`read`/`write`/`close` inside one process.  Shell
+redirection into a container path (`echo hi > /mnt/x`) is not captured:
+bash's `dup2` of a virtual fd only updates the hook's private table, so a
+child process writes to its real stdout and a builtin's buffered output is
+flushed after the redirection is restored.  Use FUSE or the library API when
+writes matter; `test/preload_probe.c` is the way to test the hook.
+
 ## Commands
 
 | Command | Purpose |

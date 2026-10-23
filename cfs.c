@@ -694,15 +694,24 @@ int cfs_pack(CFS *c, const char *cfs_path, const char *local_path) {
     if (!c || !cfs_path || !local_path) return -1;
     int lfd = open(local_path, O_RDONLY);
     if (lfd < 0) return -1;
+    struct stat st;
+    if (fstat(lfd, &st) != 0) { close(lfd); return -1; }
     off_t end = lseek(lfd, 0, SEEK_END);
     if (end < 0 || end > 0x7FFFFFFF) { close(lfd); return -1; }
     size_t sz = (size_t)end;
-    if (sz == 0) { close(lfd); return -1; }
+    /* An empty file still needs an entry: cfs_write(path, "", 0) touches it. */
+    if (sz == 0) {
+        int rc = cfs_write(c, cfs_path, "", 0);
+        if (rc == 0) cfs_utimens(c, cfs_path, (uint64_t)st.st_atime, (uint64_t)st.st_mtime);
+        close(lfd);
+        return rc;
+    }
     uint8_t *buf = malloc(sz);
     if (!buf) { close(lfd); return -1; }
     if (pread(lfd, buf, sz, 0) != (ssize_t)sz) { free(buf); close(lfd); return -1; }
     close(lfd);
     int rc = cfs_write(c, cfs_path, buf, sz);
+    if (rc == 0) cfs_utimens(c, cfs_path, (uint64_t)st.st_atime, (uint64_t)st.st_mtime);
     free(buf);
     return rc;
 }
@@ -1263,10 +1272,20 @@ static int block_patch(CFS *c, InodeEntry *e, uint32_t b, const uint8_t *src,
     uint8_t *dec = malloc(nolen);
     if (!dec) return -1;
     if (c->flags & CFS_RAW) {
-        if (pread(c->fd, dec, blk->comp_size, (off_t)blk->offset) != (ssize_t)blk->comp_size ||
-            blk->comp_size != CPENC_HEADER_SIZE + olen)
-            { free(dec); return -1; }
-        memmove(dec, dec + CPENC_HEADER_SIZE, olen);   /* strip header */
+        /* On-disk RAW payload = 12-byte header + 1 lag byte + data.  Read it
+         * into a buffer sized for the *stored* payload: reading comp_size
+         * bytes into a dec buffer sized for the uncompressed length wrote one
+         * byte past the heap block per byte of payload and corrupted the
+         * allocator (ASan: 544781-byte write into a 544768-byte region). */
+        size_t need = CPENC_HEADER_SIZE + 1 + olen;
+        if (blk->comp_size != need) { free(dec); return -1; }
+        uint8_t *comp = malloc(need);
+        if (!comp) { free(dec); return -1; }
+        if (pread(c->fd, comp, need, (off_t)blk->offset) != (ssize_t)need) {
+            free(comp); free(dec); return -1;
+        }
+        memcpy(dec, comp + CPENC_HEADER_SIZE + 1, olen);
+        free(comp);
     } else {
         uint8_t *comp = malloc(blk->comp_size);
         if (!comp) { free(dec); return -1; }

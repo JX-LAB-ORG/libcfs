@@ -123,7 +123,7 @@ static int pack_dir(CFS *c, const char *dir, const char *prefix) {
     char cmd[4096], line[4096];
     /* Use find to recursively list all files */
     snprintf(cmd, sizeof(cmd),
-             "cd \"%s\" && find . -type f -o -type d 2>/dev/null", dir);
+             "cd \"%s\" && find . \\( -type f -o -type d -o -type l \\) 2>/dev/null", dir);
 
     FILE *fp = popen(cmd, "r");
     if (!fp) return -1;
@@ -143,13 +143,22 @@ static int pack_dir(CFS *c, const char *dir, const char *prefix) {
             strncpy(vpath, line, sizeof(vpath) - 1);
 
         struct stat st;
-        if (stat(local, &st) != 0) { fprintf(stderr, "skip %s\n", local); continue; }
+        if (lstat(local, &st) != 0) { fprintf(stderr, "skip %s\n", local); continue; }
 
         if (S_ISDIR(st.st_mode)) {
             /* Create directory entry */
             int rc = cfs_mkdir(c, vpath);
             if (rc != 0) fprintf(stderr, "warn: cfs_mkdir(%s) -> %d\n", vpath, rc);
             else fprintf(stderr, "  d %s\n", vpath);
+        } else if (S_ISLNK(st.st_mode)) {
+            char target[4096];
+            ssize_t tl = readlink(local, target, sizeof(target) - 1);
+            if (tl > 0) {
+                target[tl] = 0;
+                int rc = cfs_symlink(c, target, vpath);
+                if (rc != 0) fprintf(stderr, "warn: cfs_symlink(%s) -> %d\n", vpath, rc);
+                else fprintf(stderr, "  l %s -> %s\n", vpath, target);
+            }
         } else if (S_ISREG(st.st_mode)) {
             /* Pack file */
             int rc = cfs_pack(c, vpath, local);

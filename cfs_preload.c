@@ -86,6 +86,7 @@ static CFS *cfs;
 #define VFD_RDWR    0x04
 typedef struct {
     int    active;
+    int    owner;     /* 1 = this slot owns buf; dups borrow it */
     int    flags;     /* VFD_DIRTY | VFD_WRONLY | VFD_RDWR */
     void  *buf;
     size_t size;
@@ -275,6 +276,7 @@ static int vfd_alloc(void) {
     errno = EMFILE;
     return -1;
 }
+#define PDBG(...) do { if (getenv("CFS_PDBG")) fprintf(stderr, "[preload] " __VA_ARGS__); } while (0)
 static VFile *vfd_get(int fd) {
     if (fd < 0 || fd >= MAX_VFD || !vfds[fd].active) return NULL;
     return &vfds[fd];
@@ -287,7 +289,9 @@ static VFile *vfd_get(int fd) {
 int open(const char *p, int flags, ...) {
     LOAD(_o, "open");
     char rel[256];
-    if (!resolve(p, rel, sizeof(rel))) {
+    int rok = resolve(p, rel, sizeof(rel));
+    PDBG("open(%s) resolve=%d cfs=%d flags=%x\n", p, rok, cfs != NULL, flags);
+    if (!rok) {
         va_list ap; va_start(ap, flags); mode_t m = va_arg(ap, mode_t); va_end(ap);
         return _o(p, flags, m);
     }
@@ -336,12 +340,14 @@ int open(const char *p, int flags, ...) {
     if (fd < 0) { free(buf); return -1; }
 
     vfds[fd].active   = 1;
+    vfds[fd].owner    = 1;
     vfds[fd].flags    = is_wr ? VFD_RDWR : 0;
     vfds[fd].buf      = buf;
     vfds[fd].size     = sz;
     vfds[fd].capacity = cap;
     vfds[fd].pos      = (flags & O_APPEND) ? (off_t)sz : 0;
     strncpy(vfds[fd].path, rel, 255); vfds[fd].path[255] = 0;
+    PDBG("open rel=%s fd=%d flags=%x\n", rel, fd, flags);
     return fd;
 }
 
@@ -517,6 +523,7 @@ ssize_t readv(int fd, const struct iovec *iov, int iovcnt) {
 
 ssize_t write(int fd, const void *buf, size_t n) {
     VFile *v = vfd_get(fd);
+    PDBG("write fd=%d vfd=%d n=%zu\n", fd, v != NULL, n);
     if (!v) {
         LOAD(_w, "write");
         return _w(fd, buf, n);
@@ -573,6 +580,8 @@ ssize_t pwrite(int fd, const void *buf, size_t n, off_t off) {
 
 int close(int fd) {
     VFile *v = vfd_get(fd);
+    PDBG("close fd=%d vfd=%d dirty=%d size=%zu path=%s\n", fd, v != NULL,
+         v ? !!(v->flags & VFD_DIRTY) : 0, v ? v->size : 0, v ? v->path : "");
     if (!v) {
         LOAD(_c, "close");
         return _c(fd);
@@ -580,10 +589,11 @@ int close(int fd) {
     /* Flush dirty writes to cfs */
     if ((v->flags & VFD_DIRTY) && v->path[0])
         cfs_write(cfs, v->path, v->buf, v->size);
-    free(v->buf);
+    if (v->owner) free(v->buf);
     memset(v, 0, sizeof(*v));
     return 0;
 }
+
 
 /* ═══════════════════════════════════════════════════════════════════
    lseek
@@ -797,6 +807,22 @@ typedef struct {
     int        cursor;
 } my_DIR;
 
+/* A DIR* is opaque: reading a field of a real glibc DIR to decide whether it
+ * is ours misclassified real directories and broke readdir/rm -rf in every
+ * preloaded process.  Keep a pointer registry instead. */
+#define MAX_MYDIR 64
+static my_DIR *my_dirs[MAX_MYDIR];
+static int my_dir_p(DIR *d) {
+    for (int i = 0; i < MAX_MYDIR; i++) if (my_dirs[i] == (my_DIR*)d) return 1;
+    return 0;
+}
+static void my_dir_reg(my_DIR *d) {
+    for (int i = 0; i < MAX_MYDIR; i++) if (!my_dirs[i]) { my_dirs[i] = d; return; }
+}
+static void my_dir_unreg(my_DIR *d) {
+    for (int i = 0; i < MAX_MYDIR; i++) if (my_dirs[i] == d) { my_dirs[i] = NULL; return; }
+}
+
 DIR *opendir(const char *name) {
     char rel[256];
     if (!resolve(name, rel, sizeof(rel))) {
@@ -805,6 +831,7 @@ DIR *opendir(const char *name) {
     }
     my_DIR *md = calloc(1, sizeof(*md));
     if (!md) { errno = ENOMEM; return NULL; }
+    my_dir_reg(md);
     md->is_cfs = 1;
     strncpy(md->cfs_dir, rel, 255); md->cfs_dir[255] = 0;
     int n = cfs_ls(cfs, rel, md->entries, 256);
@@ -815,22 +842,22 @@ DIR *opendir(const char *name) {
 
 int closedir(DIR *dirp) {
     if (!dirp) return 0;
-    my_DIR *md = (my_DIR*)dirp;
-    if (!md->is_cfs) {
+    if (!my_dir_p(dirp)) {
         LOAD(_cd, "closedir");
         return _cd(dirp);
     }
-    free(md);
+    my_dir_unreg((my_DIR*)dirp);
+    free(dirp);
     return 0;
 }
 
 struct dirent *readdir(DIR *dirp) {
     if (!dirp) return NULL;
-    my_DIR *md = (my_DIR*)dirp;
-    if (!md->is_cfs) {
+    if (!my_dir_p(dirp)) {
         LOAD(_rd, "readdir");
         return _rd(dirp);
     }
+    my_DIR *md = (my_DIR*)dirp;
     if (md->cursor >= md->count) { errno = 0; return NULL; }
     CfsDirEntry *e = &md->entries[md->cursor++];
     static __thread struct dirent de;
@@ -920,6 +947,7 @@ int dup(int oldfd) {
     int fd = vfd_alloc();
     if (fd < 0) return -1;
     vfds[fd].active   = 1;
+    vfds[fd].owner    = 1;
     vfds[fd].flags    = v->flags;
     vfds[fd].size     = v->size;
     vfds[fd].capacity = v->capacity;
@@ -932,6 +960,8 @@ int dup(int oldfd) {
 }
 
 int dup2(int oldfd, int newfd) {
+    PDBG("dup2 old=%d new=%d oldvfd=%d newactive=%d\n", oldfd, newfd,
+         vfd_get(oldfd) != NULL, newfd >= 0 && newfd < MAX_VFD && vfds[newfd].active);
     if (oldfd == newfd) return newfd;
     if (newfd < 0 || newfd >= MAX_VFD) { errno = EBADF; return -1; }
 
@@ -952,6 +982,7 @@ int dup2(int oldfd, int newfd) {
     }
     /* Clone */
     vfds[newfd].active   = 1;
+    vfds[newfd].owner    = 1;   /* the clone owns its buffer copy */
     vfds[newfd].flags    = v->flags;
     vfds[newfd].size     = v->size;
     vfds[newfd].capacity = v->capacity;
@@ -1076,7 +1107,15 @@ int unlink(const char *p) {
     return _ul(p);
 }
 int unlinkat(int d, const char *p, int f) {
-    if (d == AT_FDCWD) return unlink(p);
+    char rel[256];
+    if (d == AT_FDCWD) {
+        if (resolve(p, rel, sizeof(rel))) return cfs_unlink(cfs, rel);
+        /* Keep AT_REMOVEDIR: forwarding to unlink() broke rm -rf on every
+         * real directory inside a preloaded process tree. */
+        static int (*_ula)(int, const char*, int);
+        LOAD(_ula, "unlinkat");
+        return _ula(d, p, f);
+    }
     static int (*_ula)(int, const char*, int);
     LOAD(_ula, "unlinkat");
     return _ula(d, p, f);
@@ -1681,9 +1720,10 @@ ssize_t copy_file_range(int fd_in, off_t *off_in, int fd_out, off_t *off_out,
     void *tmp = malloc(len < 65536 ? len : 65536);
     if (!tmp) return -1;
     size_t blk = len < 65536 ? len : 65536;
-    size_t avail = vin ? vin->size - (size_t)ip : 0;
-    if (!vin || avail >= blk) avail = blk;
-    else blk = avail;
+    size_t avail = blk;
+    if (vin) avail = ((size_t)ip < vin->size) ? vin->size - (size_t)ip : 0;
+    if (avail < blk) blk = avail;
+    if (blk == 0) { free(tmp); return 0; }
     ssize_t nr = vin ? pread(fd_in, tmp, blk, ip)
                      : read(fd_in, tmp, blk);
     if (nr <= 0) { free(tmp); return nr; }
@@ -1691,7 +1731,14 @@ ssize_t copy_file_range(int fd_in, off_t *off_in, int fd_out, off_t *off_out,
                                 off_out ? *off_out : vout->pos)
                       : write(fd_out, tmp, (size_t)nr);
     free(tmp);
-    if (nw > 0 && off_in) *off_in = ip + nw;
+    /* coreutils cat passes off_in == NULL and expects the *file offset* to
+     * advance; without this the caller re-reads the same block forever and
+     * fills the destination disk (observed: 3.1GB from a 4KB file). */
+    if (nw > 0) {
+        if (off_in) *off_in = ip + nw;
+        else if (vin) vin->pos = ip + nw;
+        if (!off_out && vout) vout->pos += nw;
+    }
     return nw;
 }
 
