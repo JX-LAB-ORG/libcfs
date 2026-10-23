@@ -31,7 +31,10 @@ extern char **environ;
 #include <limits.h>
 #include <time.h>
 
-/* Inode mode constants (from cfs_format.h, replicated for standalone build) */
+/* Inode mode constants (from cfs_format.h, replicated for standalone build).
+ * CFS_MODE_DEDUP is deliberately absent: a dedup entry is not something this
+ * layer serves, and it must fall through to the ordinary-file path rather
+ * than be mistaken for one. */
 #define CFS_MODE_FILE    0
 #define CFS_MODE_DIR     1
 #define CFS_MODE_SYMLINK 2

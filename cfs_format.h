@@ -35,13 +35,17 @@ typedef struct {
     uint64_t created_at;     /* unix timestamp */
     uint16_t flags;          /* container attributes (RAW = uncompressed) */
 } CfsSuperBlock;
-#define CFS_SB_SIZE  40   /* 8+2+8+4+4+8+2 = 36, padded to 40 for alignment */
+/* The struct above is the in-memory form, which the compiler pads (48 bytes,
+ * flags at 40).  The on-disk form is written field by field at the offsets
+ * cfs.c uses: magic 0, version 8, inode_offset 10, inode_size 18,
+ * file_count 22, created_at 26, flags 34 — 36 bytes, padded to 40. */
+#define CFS_SB_SIZE  40   /* on-disk size; see the note above */
 #define CFS_SB_FLAG_RAW 0x0001   /* whole container stored uncompressed */
 #define CFS_SB_FLAG_REMOVABLE  0x0002  /* media behaves like USB/SD */
 #define CFS_SB_FLAG_ROTATIONAL 0x0004  /* spinning disk (0 = SSD/flash) */
 #define CFS_SB_FLAG_SD         0x0008  /* removable media is an SD card */
 
-/* ── Inode (64 + variable path name) ───────────────────────── */
+/* ── Inode (24-byte fixed part + 16 B per block + variable path) ─ */
 #define CFS_MODE_FILE   0
 #define CFS_MODE_DIR    1
 #define CFS_MODE_SYMLINK 2
@@ -67,7 +71,9 @@ typedef struct {
  * A reference means: logical[logical, logical+length) == store[store, +length).
  */
 #define CFS_STORE_PATH      "@store"
-#define CFS_DEDUP_MIN_MATCH 64   /* never emit a reference shorter than this */
+/* Reserved; the matcher's real floor is CFS_CDC_MIN (1024 B) in cfs_dedup.c.
+ * Kept so an older reader of this header still compiles. */
+#define CFS_DEDUP_MIN_MATCH 64
 #define CFS_DEDUP_BLOCK     (8u << 20)   /* reference-table block unit */
 
 /* Maintenance thresholds.  Rewriting a merged file (re-chunk, re-match) and
@@ -94,7 +100,7 @@ typedef struct {
 typedef struct {
     uint64_t orig_size;      /* uncompressed byte size */
     uint64_t mtime;          /* modification timestamp */
-    uint16_t mode;           /* CFS_MODE_FILE/DIR/SYMLINK */
+    uint16_t mode;           /* CFS_MODE_FILE/DIR/SYMLINK/DEDUP */
     uint16_t path_len;       /* byte-length of path name */
     uint32_t block_count;    /* number of blocks (>=1 for files) */
     CfsBlock *blocks;        /* heap, block_count entries */

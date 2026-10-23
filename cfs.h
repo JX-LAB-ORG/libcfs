@@ -45,7 +45,7 @@ typedef struct {
 typedef struct {
     uint64_t size;
     uint64_t mtime;
-    uint16_t mode;     /* 0=file, 1=dir, 2=symlink */
+    uint16_t mode;     /* 0=file, 1=dir, 2=symlink, 3=dedup */
     uint32_t block_count;
 } CfsStat;
 

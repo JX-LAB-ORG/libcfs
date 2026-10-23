@@ -139,8 +139,10 @@ it: superblock ranges, the inode table, every block table (including the
 blocks, and whether block headers match the table), whether DEDUP references
 stay inside `@store`, the dead-byte ratio in `@store`, and the physical
 footprint. `--deep` also decodes every block and re-reads every file through
-the library as a cross-check. It **does not go through `cfs_open()`**, so it
-can inspect containers the library itself refuses to open.
+the library as a cross-check. The structural walk parses the container itself
+rather than going through `cfs_open()`, so a container the library refuses to
+open can still be inspected; the `--deep` cross-check opens it afterwards, and
+skips that half when the open fails.
 
 ## Security model
 
