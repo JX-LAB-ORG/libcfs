@@ -49,6 +49,12 @@ cfs_ext4_install.o: cfs_ext4_install.c cfs.h
 cfs_iso9660.o: cfs_iso9660.c cfs_iso9660.h cfs.h
 	cc $(CFLAGS) -c cfs_iso9660.c -o cfs_iso9660.o
 
+# v9 sealed-container core (S0 primitives + S1 format).  Needs OpenSSL, so it
+# is deliberately NOT in $(OBJS)/all: a machine without libssl can still build
+# everything else, and `make test` probes for it before opting the suite in.
+cfs_seal.o: cfs_seal.c cfs_seal.h
+	cc $(CFLAGS) -c cfs_seal.c -o cfs_seal.o
+
 test/iso_mk.o: test/iso_mk.c
 	cc $(CFLAGS) -c test/iso_mk.c -o test/iso_mk.o
 
@@ -66,6 +72,12 @@ cfs-tool: cfs-tool.c cfs.o cfs_part.o cfs_dedup.o cfs_verify.o cfs_mkfs_fat32.o 
 
 cfs_block_hook.so: cfs_block_hook.c cfs.o cfs_part.o cfs_dedup.o ../libcpool/cpenc.o ../libcpool/bwt.o
 	cc $(CFLAGS) -fPIC cfs_block_hook.c cfs.o cfs_part.o cfs_dedup.o ../libcpool/cpenc.o ../libcpool/bwt.o -shared -ldl -lm -o cfs_block_hook.so
+
+# The seal test needs OpenSSL headers *and* a linkable libcrypto.  The Debian
+# test boxes have both; the phone (PRoot/Alpine, no libssl-dev) has neither,
+# so probe once and skip the suite there rather than break `make test`.
+HAS_OPENSSL := $(shell printf '#include <openssl/evp.h>\nint main(void){return 0;}\n' | \
+	cc -x c - -lcrypto -o /dev/null >/dev/null 2>&1 && echo yes)
 
 # cfs-fuse needs libfuse3 (apk add fuse3-dev); built only where available
 HAS_FUSE := $(shell pkg-config --exists fuse3 2>/dev/null && echo yes)
@@ -114,6 +126,13 @@ test: $(OBJS) $(CPENC) test/iso_mk.o test/ext2_read.o
 	@echo "=== cfs_path_test ==="
 	cc $(CFLAGS) test/cfs_path_test.c cfs_path.c -o test/cfs_path_test
 	./test/cfs_path_test
+ifeq ($(HAS_OPENSSL),yes)
+	@echo "=== cfs_seal_test ==="
+	cc $(CFLAGS) test/cfs_seal_test.c cfs_seal.c -lcrypto -o test/cfs_seal_test
+	./test/cfs_seal_test
+else
+	@echo "=== cfs_seal_test: skipped (no OpenSSL headers/libcrypto) ==="
+endif
 
 # Container-level benchmark: sequential/random I/O, small files, compact.
 bench: test/bench_cfs test/bench_gen test/bench_tables
@@ -177,8 +196,9 @@ fuzz:
 	sh test/fuzz.sh $(SECS)
 
 clean:
-	rm -f $(OBJS) cfs_preload.o cfs_preload.so cfs-tool cfs_block_hook.so cfs-fuse
+	rm -f $(OBJS) cfs_seal.o cfs_preload.o cfs_preload.so cfs-tool cfs_block_hook.so cfs-fuse
 	rm -f test/iso_mk.o test/ext2_read.o test/vblk_probe test/iso_gen
 	rm -f test/cfs_test test/cfs_rw_test test/cfs_dir_test test/cfs_new_test test/cfs_compact_test test/cfs_block_test test/cfs_part_test test/cfs_stress_test test/vblk_probe
 	rm -f test/cfs_dedup_test test/cfs_dedup_write_test test/cfs_dedup_writepath_test test/cfs_dedup_codec_test
+	rm -f test/cfs_seal_test
 	rm -f test/bench_cfs test/fuzz_cfs
