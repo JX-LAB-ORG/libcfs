@@ -92,6 +92,10 @@ exists for LUT-shaped blocks, not as a general speedup.
 
 ## Quick start
 
+`USAGE.md` is the task-by-task guide (build → store → make a disk → the four
+ways to mount it → verify and reclaim, plus the failure modes and every
+environment variable). What follows is the short version.
+
 ### Storing files
 
 ```sh

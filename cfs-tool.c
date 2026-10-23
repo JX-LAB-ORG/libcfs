@@ -401,12 +401,31 @@ int main(int argc, char *argv[]) {
         /* Ensure mount point exists */
         mkdir(mount_pt, 0755);
 
-        /* Spawn shell with LD_PRELOAD */
+        /* Spawn shell with LD_PRELOAD.  The environment is inherited, not
+         * replaced: a shell started with only these three variables has no
+         * PATH, HOME or TERM, so `cd ~`, `ls` from a profile and every
+         * interactive habit break for no reason the user can see.  Only the
+         * three variables this feature owns are overridden. */
         char env_preload[2048], env_mount[1024], env_file[1024];
         snprintf(env_preload, sizeof(env_preload), "LD_PRELOAD=%s/cfs_preload.so", preload);
         snprintf(env_mount, sizeof(env_mount), "CFS_MOUNT=%s", mount_pt);
         snprintf(env_file, sizeof(env_file), "CFS_FILE=%s", cfs_file);
-        char *envp[] = {env_preload, env_mount, env_file, NULL};
+        size_t en = 0;
+        while (environ[en]) en++;
+        char **envp = calloc(en + 4, sizeof(char *));
+        if (!envp) { perror("calloc"); return 1; }
+        size_t eo = 0;
+        for (size_t i = 0; i < en; i++) {
+            const char *e = environ[i];
+            if (!strncmp(e, "CFS_MOUNT=", 10) || !strncmp(e, "CFS_FILE=", 9) ||
+                !strncmp(e, "CFS_MOUNT_TREE=", 15) || !strncmp(e, "LD_PRELOAD=", 11))
+                continue;
+            envp[eo++] = environ[i];
+        }
+        envp[eo++] = env_preload;
+        envp[eo++] = env_mount;
+        envp[eo++] = env_file;
+        envp[eo]   = NULL;
 
         printf("cfs: mounting %s at %s\n", cfs_file, mount_pt);
         printf("cfs: type 'exit' to unmount\n\n");

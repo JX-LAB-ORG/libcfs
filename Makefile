@@ -13,7 +13,10 @@ CFLAGS = -std=gnu11 -fPIC -Wall -O3 $(ARCHFLAGS) -I. -I..
 OBJS = cfs.o cfs_part.o cfs_dedup.o cfs_verify.o cfs_mkfs_ext4.o cfs_mkfs_fat32.o cfs_mkfs_exfat.o cfs_ext4_install.o cfs_iso9660.o
 CPENC = ../libcpool/cpenc.o ../libcpool/bwt.o
 
-all: $(OBJS) cfs-tool cfs_block_hook.so
+# cfs_preload.so is what `cfs-tool mount` and the documented file-hook path
+# load, so a plain `make` has to produce it; leaving it to `make testall`
+# meant the README's first example failed on a clean checkout.
+all: $(OBJS) cfs-tool cfs_preload.so cfs_block_hook.so
 
 cfs.o: cfs.c cfs_internal.h cfs.h cfs_format.h ../libcpool/cpenc.h
 	cc $(CFLAGS) -c cfs.c -o cfs.o
