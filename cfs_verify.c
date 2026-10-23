@@ -445,7 +445,11 @@ static void check_block_header(VCtx *v, const VInode *in, uint32_t idx) {
         if (ver == 0 || ver > CPENC_VERSION)
             vprob(v, C_HDR, 1, "inode %u \"%s\" block %u: CPEnc version %u (this build decodes up to %u)",
                   idx, nm, b, (unsigned)ver, (unsigned)CPENC_VERSION);
-        if (h_orig != bl->orig)
+        /* A hex-wrapped block records the *folded* length in its header, not
+         * the text length the table holds; comparing them flagged every
+         * container that stored hex-ish text.  The payload carries the real
+         * length and vdecode checks it against the table. */
+        if (h[3] != CPENC_STRIDE_HEX && h_orig != bl->orig)
             vprob(v, C_HDR, 1, "inode %u \"%s\" block %u: header original_size=%u, block table says %u",
                   idx, nm, b, (unsigned)h_orig, (unsigned)bl->orig);
         if ((uint64_t)h_comp + CPENC_HEADER_SIZE != bl->comp)

@@ -346,6 +346,25 @@ CFS *cfs_open(const char *path, int flags) {
             if (bl->orig_size > CFS_BLOCK_MAX || bl->comp_size == 0) goto fail;
             if (bl->comp_size > cpenc_max_compressed_size(bl->orig_size)) goto fail;
             if ((uint64_t)bl->offset + bl->comp_size > (uint64_t)fsz) goto fail;
+            /* Cross-check the codec's own header against this entry.  The
+             * read path sizes its output buffer from bl->orig_size while the
+             * decoder trusts the header's original_size; a container where
+             * the two disagree is either torn or hostile, and handing it to
+             * the decoder is how a tampered block reached a heap overflow
+             * (the BWT branch, fixed in cpenc, but this is the layer that
+             * should never have passed the mismatch through).  HEX is exempt
+             * from the size equality: its header records the folded length,
+             * not the text length the table holds, and the payload carries
+             * the true size for the decoder to check. */
+            if (bl->comp_size < CPENC_HEADER_SIZE) goto fail;
+            {
+                uint8_t hb[CPENC_HEADER_SIZE];
+                if (pread(c->fd, hb, sizeof hb, (off_t)bl->offset) != (ssize_t)sizeof hb) goto fail;
+                if (rd16(hb) != CPENC_MAGIC) goto fail;
+                if (hb[2] < 1 || hb[2] > CPENC_VERSION) goto fail;
+                if (hb[3] != CPENC_STRIDE_HEX && rd32(hb + 4) != bl->orig_size) goto fail;
+                if ((uint64_t)rd32(hb + 8) + CPENC_HEADER_SIZE != bl->comp_size) goto fail;
+            }
         }
         /* The path has to be there.  Leaving e->path NULL with a non-zero
          * path_len used to "work" for reads — lu() checks for NULL — and
@@ -1135,8 +1154,8 @@ ssize_t cfs_block_read(CFS *c, void *buf, size_t size, off_t offset) {
  * of orig_size, so block layout is kept gap-free: writes beyond the
  * current data end zero-pad the gap (zeros compress to almost nothing),
  * and a write exactly at the data end extends the last block in place.
- * Falls back to whole-file RMW only when the 16-block cap would be
- * exceeded. */
+ * Falls back to whole-file RMW only when CFS_BLOCK_SANITY (65536 blocks)
+ * would be exceeded. */
 
 /* Logical (file-coordinate) start of block b, assuming ordered blocks. */
 static uint64_t block_blk_start(const InodeEntry *e, uint32_t b) {
