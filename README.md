@@ -1,6 +1,5 @@
 # libcfs — the Container File System (CFS)
 
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23572189.svg)](https://doi.org/10.5281/zenodo.23572189)
 ![license](https://img.shields.io/badge/license-GPL--3.0--only-blue)
 
 > One file holding a whole filesystem or disk image: compressed, deduplicated,
@@ -20,11 +19,14 @@
   the on-disk structures directly — no external tools, no mounting. An ISO9660
   reader and an ext4 installer let you install a bootable root filesystem from
   an ISO.
-- **Merge layer**: content-addressed deduplication. Unmatched bytes are
-  appended to `@store` and each file becomes a `(logical, length,
-  store_offset)` reference table; mark-and-sweep GC reclaims bytes nothing
-  references. Measured: a real 4GB image **+10.1%**, four near-copies at
-  **1/3.9**, random writes at runtime **3.7x**.
+- **Deduplication on the write path**: a file of 1KB or more is chunked with
+  content-defined boundaries (~4KB average) and only unseen chunks enter
+  `@store`; the file becomes a `(logical, length, store_offset)` reference
+  table. No maintenance command is needed. Measured: 50 copies of a 1MB text
+  file pack to **180KB in one pass** (10.1MB without dedup), near-duplicates
+  to 207KB, and all-unique data keeps 98.6% of the old throughput. The older
+  `cfs-tool dedup` merge still exists for containers written before this; GC
+  reclaims store bytes nothing references.
 - **Three mount paths**: an `LD_PRELOAD` hook (**no kernel module**), standard
   kernel FUSE, and exporting `@block` for `losetup`.
 
@@ -44,6 +46,13 @@ This section matters more than the one above:
   model.
 - **No NTFS or XFS formatter.** Pre-format with an external tool and write it
   into `@block` byte for byte (verified to work transparently).
+- **Not for text archives.** On text, xz -9 (6.77x whole-file, 5.99x with
+  independent 512KB blocks), zstd -19 (6.14x) and bzip2 all beat cpenc on
+  ratio, and xz/zstd decode faster. cfs's niche is repetition and random
+  access, not prose.
+- **Not a compressed-memory tier.** The encoder runs at 11–160 MB/s, well
+  below the hundreds of MB/s to GB/s a page-fault write path needs. Use
+  zram/zstd for that.
 - **No archive recompression.** Unpacking a `.tar.gz` and recompressing with
   cpenc saves nothing (single digits against gzip, a net loss against xz/zstd)
   and cannot reproduce the original bytes (standards specify the decoder, and
@@ -174,7 +183,7 @@ are all documented in that header. An older reader meeting an unknown mode
 ## Testing
 
 ```sh
-make test       # 11 suites
+make test       # 13 suites
 make stress     # random writes / block-limit fallback / partition loops
 make testall    # test + cfs-tool smoke test + ext4/exfat fsck acceptance + block hook test
 make fuzz       # container fuzzing (needs clang + compiler-rt)
