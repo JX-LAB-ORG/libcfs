@@ -99,7 +99,11 @@ exists for LUT-shaped blocks, not as a general speedup.
 ./cfs-tool ls out.cfs /                    # list
 ./cfs-tool cat out.cfs /file.txt           # read out (leading slash optional)
 ./cfs-tool verify out.cfs --deep           # self-check
-./cfs-tool dedup out.cfs --stats           # content-addressed merge, cross-file dedup
+./cfs-tool --help                          # every command
+
+# Deduplication happens on the write path (files >= 1KB); no maintenance
+# command is needed.  `cfs-tool dedup` remains for containers written
+# before that change.
 ```
 
 ### Making a disk

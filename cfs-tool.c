@@ -18,9 +18,10 @@ static const char *cpath(const char *p) {
     return p ? p : "";
 }
 
-static void usage(const char *prog) {    fprintf(stderr,
+static FILE *usage_fp = NULL;
+static void usage(const char *prog) {    FILE *f = usage_fp ? usage_fp : stderr; fprintf(f,
         "Usage: %s <command> [args...]\n"
-        "       %s --version\n"
+        "       %s --help | --version\n"
         "\n"
         "Commands:\n"
         "  mount  <cfs>        [mount_pt]   Mount .cfs and spawn shell\n"
@@ -168,6 +169,11 @@ int main(int argc, char *argv[]) {
     /* Two versions matter and they are not the same number: the tool can be
      * upgraded without the on-disk format moving, and a bug report that
      * names only one of them is ambiguous. */
+    if (!strcmp(cmd, "--help") || !strcmp(cmd, "-h")) {
+        usage_fp = stdout;
+        usage(argv[0]);
+        return 0;
+    }
     if (!strcmp(cmd, "--version") || !strcmp(cmd, "-V")) {
         printf("cfs-tool %s (container format %d, block codec %d)\n",
                CFS_TOOL_VERSION, CFS_VERSION, CPENC_VERSION);
