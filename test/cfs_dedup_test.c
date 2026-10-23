@@ -191,13 +191,15 @@ int main(void) {
                (off_t)(8ULL * 1024 * 1024 - 128), 256,
                "big.bin: read straddles 8MB boundary");
 
-    /* ── a plain file written AFTER the merge stays untouched ─── */
-    fprintf(stderr, "\n=== Post-merge plain file ===\n");
+    /* ── a file written after the merge goes through write-path dedup ── */
+    fprintf(stderr, "\n=== Post-merge written file ===\n");
     T(cfs_write(c, "after.bin", post, POST_SZ) == 0, "write after.bin post-merge");
     {
         CfsStat st;
         T(cfs_stat(c, "after.bin", &st) == 0, "stat after.bin");
-        T(st.mode == CFS_MODE_FILE, "after.bin is a plain file (not DEDUP)");
+        /* cfs_write() now dedups on the write path itself: a regular file is
+         * a reference table over @store, not a plain block list. */
+        T(st.mode == CFS_MODE_DEDUP, "after.bin is written dedup-mode");
         uint8_t *rb = malloc(POST_SZ);
         ssize_t n = cfs_read(c, "after.bin", rb, POST_SZ, 0);
         T(n == POST_SZ && !memcmp(rb, post, POST_SZ), "after.bin reads back correctly");

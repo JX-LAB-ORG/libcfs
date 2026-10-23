@@ -183,6 +183,10 @@ int main(int argc, char *argv[]) {
         unlink(out);
         CFS *c = cfs_create(out);
         if (!c) { fprintf(stderr, "cfs_create(%s) failed\n", out); return 1; }
+        /* Import the whole tree as one bulk write: @store then reaches disk in
+         * a few large compressed slabs instead of one small slab per file,
+         * which is what lets near-identical files share compression too. */
+        if (cfs_set_batch(c, 1) != 0) { fprintf(stderr, "pack: batch mode failed\n"); cfs_close(c); unlink(out); return 1; }
         if (raw && cfs_set_raw(c) != 0) { fprintf(stderr, "pack: set raw failed\n"); cfs_close(c); unlink(out); return 1; }
 
         int n = pack_dir(c, dir, "");

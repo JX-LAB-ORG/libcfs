@@ -105,6 +105,9 @@ test: $(OBJS) $(CPENC) test/iso_mk.o test/ext2_read.o
 	@echo "=== cfs_dedup_write_test ==="
 	cc $(CFLAGS) test/cfs_dedup_write_test.c cfs.o cfs_dedup.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o test/cfs_dedup_write_test
 	./test/cfs_dedup_write_test
+	@echo "=== cfs_dedup_writepath_test ==="
+	cc $(CFLAGS) test/cfs_dedup_writepath_test.c cfs.o cfs_dedup.o cfs_verify.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o test/cfs_dedup_writepath_test
+	./test/cfs_dedup_writepath_test
 	@echo "=== cfs_dedup_codec_test ==="
 	cc $(CFLAGS) test/cfs_dedup_codec_test.c cfs_dedup.c -o test/cfs_dedup_codec_test
 	./test/cfs_dedup_codec_test
@@ -177,5 +180,5 @@ clean:
 	rm -f $(OBJS) cfs_preload.o cfs_preload.so cfs-tool cfs_block_hook.so cfs-fuse
 	rm -f test/iso_mk.o test/ext2_read.o test/vblk_probe test/iso_gen
 	rm -f test/cfs_test test/cfs_rw_test test/cfs_dir_test test/cfs_new_test test/cfs_compact_test test/cfs_block_test test/cfs_part_test test/cfs_stress_test test/vblk_probe
-	rm -f test/cfs_dedup_test test/cfs_dedup_write_test test/cfs_dedup_codec_test
+	rm -f test/cfs_dedup_test test/cfs_dedup_write_test test/cfs_dedup_writepath_test test/cfs_dedup_codec_test
 	rm -f test/bench_cfs test/fuzz_cfs

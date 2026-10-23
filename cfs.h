@@ -217,6 +217,17 @@ int    cfs_write(CFS *cfs, const char *path,
                  const void *buf, size_t size);
 int    cfs_pack(CFS *cfs, const char *cfs_path, const char *local_path);
 
+/* Bulk-write mode.  With `on`, a successful write leaves the pending @store
+ * bytes and the inode table in memory until the next cfs_sync(), finalise or
+ * close, so importing many files compresses @store in a few large slabs
+ * instead of one small slab per file — small slabs cannot see the similarity
+ * between files, which is what dedup relies on.  The sync window is the one a
+ * single write already has (an append reuses the old inode-table bytes), only
+ * longer; use it for a build/import that can be redone, not as a durability
+ * promise.  Turning it off syncs first.  Returns 0, or -1 on a read-only
+ * handle or a failed final sync. */
+int    cfs_set_batch(CFS *cfs, int on);
+
 /* ─── Batch creation (build container from scratch) ──────────── */
 CFS   *cfs_create(const char *path);
 /* Mark a container as RAW (uncompressed) and persist it in the

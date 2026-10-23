@@ -38,12 +38,15 @@ static int inode_grow_blocks(InodeEntry *e, uint32_t n) {
 
 /* Merge layer — defined at the end of this file. */
 static ssize_t dedup_read(CFS *c, InodeEntry *e, void *buf, size_t size, off_t offset);
+static int dt_load(CFS *c, InodeEntry *e);
 static void dedup_cache_drop(CFS *c);
 static int dedup_fi_add(CFS *c, const uint8_t *p, size_t n, uint64_t off);
 static int dedup_pend_ready(CFS *c);
 static int dedup_pend_flush(CFS *c);
 static int dedup_table_flush(CFS *c);
 static int dedup_emit(CFS *c, const uint8_t *p, size_t n, uint64_t *out_off);
+static int dedup_index_ready(CFS *c);
+static int cfs_write_dedup(CFS *c, const char *path, const void *buf, size_t size);
 static int cfs_lock(CFS *c);
 
 /* ── Container-file writes: two kinds, one of them quota-guarded ──
@@ -121,6 +124,12 @@ static int cfs_sync(CFS *c) {
     for (uint32_t i = 0; i < c->inode_count; i++) {
         /* Reserved entries (@block, @store) are internal — see cfs_open. */
         int user = !(c->inodes[i].path && c->inodes[i].path[0] == '@');
+        /* @store is the bytes a DEDUP file's reference table points at, so it
+         * counts toward the compressed side even though it is not a user
+         * file; without it a packed duplicate tree reports only its tables
+         * as its size.  @block is a device image, not user content, and stays
+         * out. */
+        int store = c->inodes[i].path && !strcmp(c->inodes[i].path, CFS_STORE_PATH);
         if (user) {
             c->st.total_orig_size += c->inodes[i].raw.orig_size;
             c->st.file_count++;
@@ -128,7 +137,7 @@ static int cfs_sync(CFS *c) {
         for (uint32_t b = 0; b < c->inodes[i].raw.block_count; b++) {
             uint64_t be = c->inodes[i].raw.blocks[b].offset + c->inodes[i].raw.blocks[b].comp_size;
             if (be > data_end) data_end = be;
-            if (user) c->st.total_compressed_size += c->inodes[i].raw.blocks[b].comp_size;
+            if (user || store) c->st.total_compressed_size += c->inodes[i].raw.blocks[b].comp_size;
         }
     }
     c->st.compress_ratio = c->st.total_compressed_size > 0
@@ -136,11 +145,15 @@ static int cfs_sync(CFS *c) {
     c->sb.file_count = c->inode_count;
 
     /* Write inode table after last data block, then superblock.
-     * Table position is monotonic (high-water of previous table end):
-     * in-place block shrink can pull data_end backward, and a retreating
-     * table would sit inside data that a later append reuses. */
-    uint64_t hi = c->sb.inode_offset + c->sb.inode_size;
-    uint64_t io = data_end > hi ? data_end : hi;
+     * Table position is monotonic: it lands at the append cursor, or after
+     * the data when the last writer appended without moving the cursor
+     * (block_patch advances its own local cursor).  The floor used to be the
+     * *previous table's end*, which grew the container by a whole table on
+     * every sync even when no data was written — 2000 x 400 B files cost
+     * 98 MB — and that slack is what made per-file reference tables look
+     * expensive.  The cursor itself is enough: every data append starts
+     * there, and no path moves it backward. */
+    uint64_t io = data_end > c->sb.inode_offset ? data_end : c->sb.inode_offset;
     off_t io_off = (off_t)io;
     if (cfs_pw_meta(c, tab, c->sb.inode_size, io_off) != (ssize_t)c->sb.inode_size) {
         free(tab); return -1;
@@ -160,6 +173,7 @@ static int cfs_sync(CFS *c) {
     wr16(sb + 34, c->sb.flags);
     if (cfs_pw_meta(c, sb, CFS_SB_SIZE, 0) != CFS_SB_SIZE) return -1;
     if (fsync(c->fd) != 0) return -1;
+    c->dirty = 0;                     /* in-memory table is now on disk */
     if (canary_a != 0xCAFEBABECAFEBABEULL || canary_b != 0xDEADBEEFDEADBEEFULL)
         write(2, "CANARY CORRUPT in cfs_sync\n", 27);
     return 0;
@@ -239,6 +253,13 @@ int cfs_finalise(CFS *c) {
     return cfs_sync(c);
 }
 
+int cfs_set_batch(CFS *c, int on) {
+    if (!c || !(c->flags & CFS_RDWR)) return -1;
+    if (!on && (c->pend_n || c->dirty || c->dt_dirty) && cfs_sync(c) != 0) return -1;
+    c->batch = on ? 1 : 0;
+    return 0;
+}
+
 /* ── Open ─────────────────────────────────────────────────── */
 /* ── One writer at a time ────────────────────────────────────────
  * A sync updates the data blocks, then the inode table, then the superblock,
@@ -282,6 +303,7 @@ CFS *cfs_open(const char *path, int flags) {
     }
 
     uint8_t sb[CFS_SB_SIZE];
+    uint8_t *it = NULL;      /* raw inode table; freed on every exit path */
     if (pread(c->fd, sb, CFS_SB_SIZE, 0) != CFS_SB_SIZE) goto fail;
     if (memcmp(sb, CFS_MAGIC, 8) || rd16(sb + 8) != CFS_VERSION) {
         goto fail;
@@ -312,9 +334,9 @@ CFS *cfs_open(const char *path, int flags) {
         goto fail;
     if (c->sb.file_count == 0) return c;
 
-    uint8_t *it = malloc(c->sb.inode_size);
+    it = malloc(c->sb.inode_size);
     if (!it || pread(c->fd, it, c->sb.inode_size, (off_t)c->sb.inode_offset) != (ssize_t)c->sb.inode_size)
-        { free(it); goto fail; }
+        goto fail;
     c->inodes = calloc(c->sb.file_count, sizeof(InodeEntry));
     if (!c->inodes) { free(it); goto fail; }
 
@@ -377,12 +399,17 @@ CFS *cfs_open(const char *path, int flags) {
         e->path[e->raw.path_len] = 0;
         p += e->raw.path_len;
         /* Reserved entries (@block, @store) are internal: they are not
-         * user files and would double-count merged bytes. */
+         * user files and would double-count merged bytes.  The store's own
+         * blocks are still the bytes the DEDUP files read, so they are part
+         * of the compressed side (see the same accounting in cfs_sync). */
         if (!(e->path && e->path[0] == '@')) {
             c->st.total_orig_size += e->raw.orig_size;
             for (uint32_t b = 0; b < e->raw.block_count; b++)
                 c->st.total_compressed_size += e->raw.blocks[b].comp_size;
             c->st.file_count++;
+        } else if (e->path && !strcmp(e->path, CFS_STORE_PATH)) {
+            for (uint32_t b = 0; b < e->raw.block_count; b++)
+                c->st.total_compressed_size += e->raw.blocks[b].comp_size;
         }
         c->inode_count++;
     }
@@ -391,12 +418,27 @@ CFS *cfs_open(const char *path, int flags) {
         ? (float)c->st.total_orig_size / (float)c->st.total_compressed_size : 1.0f;
     return c;
 fail:
+    /* Everything allocated before the refusal has to go back: a container
+     * whose table fails validation is exactly the case a reader is most
+     * likely to hit on purpose (cfs_verify does), and leaking one table per
+     * attempt is how an inspection loop becomes an OOM.  The inode array is
+     * calloc'd to file_count, so entries an early goto never reached are
+     * zeroed and safe to walk. */
+    free(it);
+    if (c->inodes) {
+        for (uint32_t i = 0; i < c->sb.file_count; i++) {
+            free(c->inodes[i].path);
+            free(c->inodes[i].raw.blocks);
+        }
+        free(c->inodes);
+    }
+    free(c->cpath);
     close(c->fd); free(c); return NULL;
 }
 
 void cfs_close(CFS *c) {
     if (!c) return;
-    if ((c->flags & CFS_RDWR) && (c->pend_n || c->dt_dirty)) cfs_sync(c);
+    if ((c->flags & CFS_RDWR) && (c->pend_n || c->dt_dirty || c->dirty)) cfs_sync(c);
     if (c->locked) flock(c->fd, LOCK_UN);   /* close would drop it anyway */
     if (c->fd >= 0) close(c->fd);
     dedup_cache_drop(c);
@@ -522,6 +564,16 @@ int cfs_write(CFS *c, const char *path, const void *buf, size_t size) {
         return cfs_sync(c);
     }
     if (!buf) return -1;
+
+    /* Content-addressed write path (v7 G3).  A regular file large enough to
+     * hold at least one content-defined chunk is written as a reference
+     * table over the shared @store: the first copy of any chunk lands in the
+     * store, later copies (in this file or any other) become references.  The
+     * reserved entries (@store, @block) and RAW containers keep the plain
+     * block path — @store cannot reference itself, and RAW stores bytes
+     * verbatim, so chunking would only add indirection. */
+    if (!(c->flags & CFS_RAW) && path[0] != '@' && size >= CFS_CDC_MIN)
+        return cfs_write_dedup(c, path, buf, size);
 
     InodeEntry *e = lu(c, path);
     int is_new = (e == NULL);
@@ -703,8 +755,14 @@ int cfs_unlink(CFS *c, const char *path) {
                     }
                 }
             }
-            /* Free and shift remaining entries */
+            /* Free and shift remaining entries.  The removed entry's block
+             * table has to go too: the memmove overwrites the slot without
+             * freeing what it held, which leaked one block array per unlink
+             * (the ASan run of cfs_dir_test is what found it).  The tail slot
+             * the memmove leaves behind is a duplicate of the last live entry
+             * and sits past inode_count, so it is never freed twice. */
             free(c->inodes[i].path);
+            free(c->inodes[i].raw.blocks);
             if (i < c->inode_count - 1)
                 memmove(&c->inodes[i], &c->inodes[i + 1],
                         (c->inode_count - i - 1) * sizeof(InodeEntry));
@@ -722,9 +780,33 @@ int cfs_unlink(CFS *c, const char *path) {
 int cfs_truncate(CFS *c, const char *path, uint64_t size) {
     if (!c || !(c->flags & CFS_RDWR) || !path) return -1;
     InodeEntry *e = lu(c, path);
-    if (!e || e->raw.mode != CFS_MODE_FILE) return -1;
+    if (!e) return -1;
 
     if (size == e->raw.orig_size) return 0;
+
+    /* A reference table is trimmed in place: refs past the new end are
+     * dropped and the one straddling it is shortened.  What is cut off were
+     * only references into @store, so nothing has to be written there; those
+     * bytes become dead and GC reclaims them later.  Extending past the old
+     * end leaves a hole, which the read path already returns as zeros. */
+    if (e->raw.mode == CFS_MODE_DEDUP) {
+        if (dt_load(c, e) != 0) return -1;
+        uint32_t w = 0;
+        for (uint32_t i = 0; i < c->dt.n; i++) {
+            CfsRef r = c->dt.v[i];
+            if (r.logical >= size) break;
+            if (r.logical + r.length > size) r.length = size - r.logical;
+            c->dt.v[w++] = r;
+        }
+        c->dt.n = w;
+        c->dt.logical_size = size;
+        c->dt_dirty = 1;
+        e->raw.orig_size = size;
+        e->raw.mtime = (uint64_t)time(NULL);
+        return cfs_sync(c);
+    }
+
+    if (e->raw.mode != CFS_MODE_FILE) return -1;
 
     if (size == 0) {
         e->raw.orig_size   = 0;
@@ -926,6 +1008,11 @@ int cfs_chown(CFS *c, const char *path, uint32_t uid, uint32_t gid) {
    ═══════════════════════════════════════════════════════════════════ */
 int cfs_compact(CFS *c) {
     if (!c || !(c->flags & CFS_RDWR)) return -1;
+
+    /* The copy below reads blocks back through the file descriptor, so a
+     * bulk-mode handle that still holds store bytes or an unwritten table in
+     * memory has to land them first. */
+    if ((c->pend_n || c->dirty) && cfs_sync(c) != 0) return -1;
 
     /* The rebuilt copy and the container are both on disk while this runs,
      * so compact needs transient double space.  Refuse up front rather than
@@ -1660,6 +1747,13 @@ uint64_t cfs_physical_used(CFS *c) {
 
 #define DEDUP_IO_CHUNK (8u << 20)   /* merge-pass append unit */
 #define DEDUP_WIN      (8u << 20)   /* merge-pass read window */
+/* Largest slab @store is compressed in.  The pending buffer grows on demand
+ * up to this size, so the write path gives the store the same compression
+ * context the plain block path gives a file of the same size, instead of
+ * resetting it every 8MB.  A store made only of misses is byte-for-byte the
+ * input file, so at this size its compressed form matches what the plain path
+ * would have produced. */
+#define DEDUP_IO_MAX   ((size_t)CFS_BLOCK_SPLIT)
 
 static void dedup_cache_drop(CFS *c) {
     cfs_dedup_table_free(&c->dt);
@@ -1778,14 +1872,14 @@ static int store_append(CFS *c, const uint8_t *buf, size_t len, uint64_t *out_of
     if (!e) return -1;
     *out_off = e->raw.orig_size;
     if (len == 0) return 0;
-    uint32_t nb = (uint32_t)((len + DEDUP_IO_CHUNK - 1) / DEDUP_IO_CHUNK);
+    uint32_t nb = (uint32_t)((len + DEDUP_IO_MAX - 1) / DEDUP_IO_MAX);
     uint8_t **data = calloc(nb, sizeof(*data));
     size_t *cl = calloc(nb, sizeof(*cl));
     size_t *ol = calloc(nb, sizeof(*ol));
     if (!data || !cl || !ol) { free_pieces(data, cl, ol, nb, 0); return -1; }
     for (uint32_t i = 0; i < nb; i++) {
-        size_t bo = (size_t)i * DEDUP_IO_CHUNK;
-        size_t bs = bo + DEDUP_IO_CHUNK <= len ? DEDUP_IO_CHUNK : len - bo;
+        size_t bo = (size_t)i * DEDUP_IO_MAX;
+        size_t bs = bo + DEDUP_IO_MAX <= len ? DEDUP_IO_MAX : len - bo;
         if (block_hole_pack(c, buf + bo, bs, &data[i], &cl[i]) != 0) {
             free_pieces(data, cl, ol, nb, i); return -1;
         }
@@ -1951,6 +2045,9 @@ static int scan_stream(CFS *c, const char *path, uint64_t size, CfsDedupTable *e
  * append it to @store and index it. */
 int cfs_dedup_merge(CFS *c) {
     if (!c || !(c->flags & CFS_RDWR)) return -1;
+    /* The merge reads @store and every file back from disk; bulk mode may
+     * still be holding both in memory. */
+    if ((c->pend_n || c->dirty) && cfs_sync(c) != 0) return -1;
     /* Snapshot the paths first: creating @store reallocs the inode array. */
     char **paths = malloc(sizeof(char*) * (c->inode_count + 1));
     if (!paths) return -1;
@@ -2069,6 +2166,18 @@ static int dedup_emit(CFS *c, const uint8_t *p, size_t n, uint64_t *out_off) {
      * buffered), charging raw bytes where the append will charge compressed
      * ones: conservative, which is the right direction for a safety limit. */
     if (cfs_phys_room(c, (off_t)c->sb.inode_offset, c->pend_n + n) != 0) return -1;
+    /* Grow the staging buffer instead of flushing as soon as it fills, up to
+     * one block: that keeps the store's compression context intact across
+     * many small misses.  Beyond the cap the buffer is flushed and the chunk
+     * (at most CFS_CDC_MAX) goes into the fresh one. */
+    while (c->pend_n + n > c->pend_cap && c->pend_cap < DEDUP_IO_MAX) {
+        size_t nc = c->pend_cap ? c->pend_cap * 2 : DEDUP_IO_CHUNK;
+        if (nc > DEDUP_IO_MAX) nc = DEDUP_IO_MAX;
+        uint8_t *nb = realloc(c->pend_buf, nc);
+        if (!nb) break;
+        c->pend_buf = nb;
+        c->pend_cap = nc;
+    }
     if (c->pend_n + n > c->pend_cap && dedup_pend_flush(c) != 0) return -1;
     *out_off = c->pend_off + c->pend_n;
     memcpy(c->pend_buf + c->pend_n, p, n);
@@ -2081,6 +2190,38 @@ static int dedup_fi_add(CFS *c, const uint8_t *p, size_t n, uint64_t off) {
     uint64_t k[2];
     cfs_feature_hash(p, n, k);
     return cfs_feat_index_put(&c->fi, k, off, (uint32_t)n);
+}
+
+/* Make the feature index usable for matching against bytes that reached
+ * @store before this handle was opened.
+ *
+ * The index is not persisted; it is rebuilt once, lazily, on the first write
+ * that needs it, by re-chunking @store exactly the way the writer chunked the
+ * bytes that went into it (the CDC cut points are content-defined, so a
+ * second pass over the store finds the same boundaries).  Cost: one sequential
+ * decompress of the whole store, O(store bytes) time, and 32 B of index per
+ * ~4 KB chunk (≈ 8 MB per GB of store at a load factor of 0.7, rounded up to
+ * the power of two).  It is never redone per write or per file.  Containers
+ * written in one session never pay it at all: the index is filled as chunks
+ * are emitted.
+ *
+ * Chunks at a file's end whose cut was forced by EOF rather than found by the
+ * mask are a known blind spot of the rebuild (in the store they are followed
+ * by other content, so the re-chunk joins them to it); such a chunk is simply
+ * stored again if a later session writes the same file, never mis-referenced. */
+static int dedup_index_ready(CFS *c) {
+    if (c->fi_ready) return 0;
+    cfs_feat_index_init(&c->fi);
+    c->fi_ready = 1;
+    InodeEntry *se = lu(c, CFS_STORE_PATH);
+    if (se && se->raw.orig_size) {
+        if (scan_stream(c, CFS_STORE_PATH, se->raw.orig_size, NULL) != 0) {
+            cfs_feat_index_free(&c->fi);
+            c->fi_ready = 0;
+            return -1;
+        }
+    }
+    return 0;
 }
 
 /* Put (logical, length, store) into a sorted table, replacing whatever it
@@ -2159,6 +2300,7 @@ ssize_t cfs_dedup_write(CFS *c, const char *path, const void *vbuf, size_t size,
     InodeEntry *e = lu(c, path);
     if (!e || e->raw.mode != CFS_MODE_DEDUP) return -1;
     if (dt_load(c, e) != 0) return -1;               /* c->dt is this file's */
+    if (dedup_index_ready(c) != 0) return -1;        /* matches earlier sessions too */
     const uint8_t *buf = vbuf;
     uint64_t off = (uint64_t)offset;
 
@@ -2221,6 +2363,109 @@ rollback:
     if (snap) { memcpy(c->dt.v, snap, snap_n * sizeof *snap); free(snap); }
     c->dt.n = snap_n;
     c->dt.logical_size = snap_ls;
+    return -1;
+}
+
+/* Whole-file content-addressed write: the path cfs_write() takes for a
+ * regular file on a writable, non-RAW container.
+ *
+ * The file is chunked with the same CDC pass the merge layer uses, every chunk
+ * is looked up in the feature index, and only misses are appended to @store;
+ * the file's blocks[] become a reference table (CFS_MODE_DEDUP).  Nothing is
+ * ever rewritten afterwards: a duplicate costs one table and no store bytes,
+ * which is what `cfs-tool dedup` used to achieve with a full merge + compact.
+ *
+ * Ordering: store bytes are staged in the handle's pending buffer and the
+ * table blocks are written at the append cursor.  cfs_sync() flushes the
+ * pending store bytes *before* the inode table that points at them, so a sync
+ * that completes leaves no table resolving to a hole.  (As everywhere in this
+ * format, the unsafe window is an append that has already overwritten the old
+ * table's bytes and has not synced yet; bulk mode only lengthens it.)
+ *
+ * Quota: dedup_emit() charges the raw bytes it stages (the append will charge
+ * their compressed size — conservative), and dedup_write_table() charges the
+ * table blocks it writes.  The content never goes through the plain block
+ * path, so no byte is charged twice. */
+static int cfs_write_dedup(CFS *c, const char *path, const void *vbuf, size_t size) {
+    const uint8_t *buf = vbuf;
+    if (dedup_pend_ready(c) != 0) return -1;
+    if (dedup_index_ready(c) != 0) return -1;
+
+    /* A table cached for another file (this is the write path, so no read or
+     * in-place write is holding it) must reach disk before dedup_write_table()
+     * would drop it; and a cached table for THIS path is about to become
+     * stale.  Either way, drop the cache after flushing. */
+    if (c->dt_dirty && dedup_table_flush(c) != 0) return -1;
+    dedup_cache_drop(c);
+
+    CfsDedupTable t;
+    cfs_dedup_table_init(&t, size);
+    size_t done = 0;
+    while (done < size) {
+        size_t avail = size - done;
+        size_t clen;
+        if (avail < CFS_CDC_MIN) {
+            clen = avail;                    /* short tail: too small to cut */
+        } else {
+            clen = cfs_cdc_next(buf + done, avail);
+            if (clen == 0 || clen > avail) clen = avail;
+        }
+        uint64_t k[2], soff = 0;
+        int hit = 0;
+        /* The last chunk of a file may be shorter than CFS_CDC_MIN; those are
+         * stored but never indexed, exactly as cfs_dedup_write() does, so the
+         * two write paths agree on what the index contains. */
+        if (clen >= CFS_CDC_MIN) {
+            cfs_feature_hash(buf + done, clen, k);
+            hit = cfs_feat_index_get(&c->fi, k, (uint32_t)clen, &soff);
+        }
+        if (!hit) {
+            if (dedup_emit(c, buf + done, clen, &soff) != 0) goto fail;
+            if (clen >= CFS_CDC_MIN && dedup_fi_add(c, buf + done, clen, soff) != 0)
+                goto fail;
+        }
+        /* Offsets are file-relative: the whole file is being replaced, so the
+         * table starts at logical 0.  Adjacent chunks whose store ranges also
+         * continue coalesce into one tuple, which keeps a plain unique file's
+         * table at a single reference. */
+        if (ref_push(&t, done, clen, soff) != 0) goto fail;
+        done += clen;
+    }
+
+    InodeEntry *e = lu(c, path);
+    int is_new = (e == NULL);
+    if (is_new) {
+        InodeEntry *na = realloc(c->inodes, (c->inode_count + 1) * sizeof(InodeEntry));
+        if (!na) goto fail;
+        c->inodes = na;
+        e = &c->inodes[c->inode_count];
+        memset(e, 0, sizeof(*e));
+        e->path = strdup(path);
+        if (!e->path) goto fail;
+        e->raw.path_len = (uint16_t)strlen(path);
+        c->inode_count++;
+    }
+    if (dedup_write_table(c, e, &t) != 0) {
+        if (is_new) {      /* the table write may have allocated a block list */
+            free(e->path);
+            free(e->raw.blocks);
+            e->path = NULL; e->raw.blocks = NULL; e->raw.block_count = 0;
+            c->inode_count--;
+        }
+        goto fail;
+    }
+    cfs_dedup_table_free(&t);
+    /* In bulk mode the pending store bytes and the new table stay in memory;
+     * one sync at the end then flushes them together, so the store is
+     * compressed in few large slabs and can still see the similarity the
+     * dedup itself does.  A non-bulk write syncs here, as before. */
+    if (c->batch) { c->dirty = 1; return 0; }
+    return cfs_sync(c);
+
+fail:
+    /* Store bytes already staged stay staged: they will be appended
+     * unreferenced (a few bytes of dead data until GC), never mis-referenced. */
+    cfs_dedup_table_free(&t);
     return -1;
 }
 
@@ -2299,6 +2544,8 @@ static void dedup_cursor_reserve(CFS *c, uint64_t off) {
 
 int cfs_dedup_gc(CFS *c, CfsDedupGcStats *out) {
     if (!c || !(c->flags & CFS_RDWR)) return -1;
+    /* Same as merge: everything below reads the container from disk. */
+    if ((c->pend_n || c->dirty) && cfs_sync(c) != 0) return -1;
     CfsDedupGcStats st;
     memset(&st, 0, sizeof st);
     InodeEntry *se = lu(c, CFS_STORE_PATH);
@@ -2444,6 +2691,11 @@ int cfs_dedup_gc(CFS *c, CfsDedupGcStats *out) {
         }
     }
     dedup_cache_drop(c);
+    /* Reclamation moved every store byte to a new offset, so the in-memory
+     * feature index (whose entries are store offsets) no longer describes the
+     * container.  Drop it; the next write rebuilds it from the new @store.
+     * Leaving it would make later writes reference the wrong bytes. */
+    if (c->fi_ready) { cfs_feat_index_free(&c->fi); c->fi_ready = 0; }
     if (cfs_sync(c) != 0) rc = -1;
     if (out) *out = st;
     return rc;

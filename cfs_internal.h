@@ -57,6 +57,16 @@ struct CFS {
     /* Set when this handle holds the container's advisory lock (see
      * cfs_lock in cfs.c).  Released on close. */
     int           locked;
+
+    /* Bulk-write mode (cfs_set_batch): hold the pending @store bytes and the
+     * inode table in memory across writes, so a multi-file import compresses
+     * the store in a few large blocks instead of one block per file.  This
+     * lengthens (it does not create) the window in which the on-disk table
+     * has been overwritten by an append but not yet rewritten; see the API
+     * comment.  `dirty` records that the in-memory table has not been written
+     * yet, so close() knows to. */
+    int           batch;
+    int           dirty;
 };
 
 #endif /* CFS_INTERNAL_H */

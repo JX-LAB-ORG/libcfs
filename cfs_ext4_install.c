@@ -500,8 +500,12 @@ int cfs_mkfs_ext4_install(CFS *c, uint64_t base_off, uint64_t size,
 
     if (cfs_mkfs_ext4_at(c, base_off, size)) { fprintf(stderr, "DBG: mkfs\n"); iso9660_close(fs); return -1; }
 
-    InstCtx x;
-    if (ctx_init(&x, c, base_off)) { fprintf(stderr, "DBG: ctx_init\n"); iso9660_close(fs); return -1; }
+    InstCtx x = {0};
+    if (ctx_init(&x, c, base_off)) {
+        fprintf(stderr, "DBG: ctx_init\n");
+        free(x.bmp); free(x.ibmp); free(x.itab); free(x.bbm); free(x.ibm);
+        iso9660_close(fs); return -1;
+    }
 
     int rc = 0;
     for (int i = 0; i < n && rc == 0; i++) {
@@ -556,6 +560,7 @@ if (e.is_dir) {
     if (rc == 0) rc = ctx_finish(&x);
     if (rc) fprintf(stderr, "DBG: loop/finish rc=%d (n=%d)\n", rc, n);
     free(x.bbm); free(x.ibm); free(x.ents); free(x.dirty);
+    free(x.bmp); free(x.ibmp); free(x.itab);
     iso9660_close(fs);
     return rc;
 }
