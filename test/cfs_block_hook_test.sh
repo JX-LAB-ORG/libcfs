@@ -2,7 +2,11 @@
 # cfs_block_hook_test.sh — virtual block device + partition device semantics
 set -u
 cd "$(dirname "$0")/.." || exit 1
-T=/tmp/cfs_hook_test
+# The container this test builds is 64MB and it fills it; on a shared host
+# /tmp can be a small tmpfs that other work fills up, and the failure then
+# looks like a quota bug ("the quota still lets writes through" fails because
+# the write hit ENOSPC on the host filesystem).  Honour TMPDIR.
+T=${TMPDIR:-/tmp}/cfs_hook_test
 rm -rf "$T"; mkdir -p "$T"
 PASS=0; FAIL=0
 ck() { if [ "$1" = "$2" ]; then PASS=$((PASS+1)); echo "  OK $3"; else FAIL=$((FAIL+1)); echo "  FAIL $3 (got '$1' want '$2')"; fi; }
