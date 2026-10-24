@@ -129,6 +129,9 @@ test: $(OBJS) $(CPENC) test/iso_mk.o test/ext2_read.o
 	@echo "=== cfs_path_test ==="
 	cc $(CFLAGS) test/cfs_path_test.c cfs_path.c -o test/cfs_path_test
 	./test/cfs_path_test
+	@echo "=== cfs_regress_test ==="
+	cc $(CFLAGS) test/cfs_regress_test.c cfs.o cfs_dedup.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o test/cfs_regress_test
+	./test/cfs_regress_test
 ifeq ($(HAS_OPENSSL),yes)
 	@echo "=== cfs_seal_test ==="
 	cc $(CFLAGS) test/cfs_seal_test.c cfs_seal.c -lcrypto -o test/cfs_seal_test
@@ -201,7 +204,7 @@ fuzz:
 clean:
 	rm -f $(OBJS) cfs_seal.o cfs_preload.o cfs_preload.so cfs-tool cfs_block_hook.so cfs-fuse
 	rm -f test/iso_mk.o test/ext2_read.o test/vblk_probe test/iso_gen
-	rm -f test/cfs_test test/cfs_rw_test test/cfs_dir_test test/cfs_new_test test/cfs_compact_test test/cfs_block_test test/cfs_part_test test/cfs_stress_test test/vblk_probe
+	rm -f test/cfs_regress_test test/cfs_test test/cfs_rw_test test/cfs_dir_test test/cfs_new_test test/cfs_compact_test test/cfs_block_test test/cfs_part_test test/cfs_stress_test test/vblk_probe
 	rm -f test/cfs_dedup_test test/cfs_dedup_write_test test/cfs_dedup_writepath_test test/cfs_dedup_codec_test
 	rm -f test/cfs_seal_test
 	rm -f test/bench_cfs test/fuzz_cfs

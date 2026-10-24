@@ -36,6 +36,10 @@ static int inode_grow_blocks(InodeEntry *e, uint32_t n) {
     return 0;
 }
 
+/* Block payload builder — defined with the block layer, used by truncate. */
+static int block_hole_pack(CFS *c, const uint8_t *seg, size_t len,
+                           uint8_t **out, size_t *outcl);
+
 /* Merge layer — defined at the end of this file. */
 static ssize_t dedup_read(CFS *c, InodeEntry *e, void *buf, size_t size, off_t offset);
 static int dt_load(CFS *c, InodeEntry *e);
@@ -512,7 +516,23 @@ ssize_t cfs_read(CFS *c,const char *path,void *buf,size_t size,off_t offset){
     return (ssize_t)total;
 }
 
-void *cfs_read_all(CFS *c,const char *path,size_t *out){InodeEntry *e=lu(c,path);if(!e||(e->raw.mode!=CFS_MODE_FILE&&e->raw.mode!=CFS_MODE_SYMLINK&&e->raw.mode!=CFS_MODE_DEDUP))return NULL;void *b=malloc(e->raw.orig_size?e->raw.orig_size:1);if(!b)return NULL;if(e->raw.orig_size==0){if(out)*out=0;return b;}if(cfs_read(c,path,b,e->raw.orig_size,0)!=(ssize_t)e->raw.orig_size){free(b);return NULL;}if(out)*out=e->raw.orig_size;return b;}
+void *cfs_read_all(CFS *c,const char *path,size_t *out){
+    InodeEntry *e = lu(c, path);
+    if (!e || (e->raw.mode != CFS_MODE_FILE && e->raw.mode != CFS_MODE_SYMLINK &&
+               e->raw.mode != CFS_MODE_DEDUP)) return NULL;
+    /* Take the size before the call: a read of a merge-layer file can flush
+     * pending bytes, which adds @store and reallocs the inode array, so `e`
+     * is not valid across cfs_read() — reading it again on the other side of
+     * the comparison was a use-after-free whose visible symptom was a file
+     * that had just been written "failing to read back". */
+    size_t need = e->raw.orig_size;
+    void *b = malloc(need ? need : 1);
+    if (!b) return NULL;
+    if (need == 0) { if (out) *out = 0; return b; }
+    if (cfs_read(c, path, b, need, 0) != (ssize_t)need) { free(b); return NULL; }
+    if (out) *out = need;
+    return b;
+}
 
 int cfs_ls(CFS *c,const char *dir,CfsDirEntry *ents,int max){
     if(!c||!dir||!ents||max<=0)return 0;
@@ -873,19 +893,33 @@ int cfs_truncate(CFS *c, const char *path, uint64_t size) {
                      (off_t)lb_off) != (ssize_t)e->raw.blocks[keep - 1].orig_size) {
             free(lb); return -1;
         }
-        size_t mc = cpenc_max_compressed_size((size_t)rem);
-        uint8_t *comp = malloc(mc);
-        if (!comp) { free(lb); return -1; }
-        size_t cl = mc;
-        int rc = cpenc_compress(lb, (size_t)rem, comp, &cl, 2);
+        /* Compress the surviving prefix the way this container stores blocks
+         * — raw when the container is raw, compressed otherwise. */
+        size_t cl = 0;
+        uint8_t *comp = NULL;
+        if (block_hole_pack(c, lb, (size_t)rem, &comp, &cl) != 0) { free(lb); return -1; }
         free(lb);
-        if (rc) { free(comp); return -1; }
-        off_t wo = (off_t)e->raw.blocks[keep - 1].offset;
-        if (cfs_pw(c, comp, cl, wo) != (ssize_t)cl) {
-            free(comp); return -1;
+        CfsBlock *lb_blk = &e->raw.blocks[keep - 1];
+        if (cl <= lb_blk->comp_size) {
+            if (cfs_pw(c, comp, cl, (off_t)lb_blk->offset) != (ssize_t)cl) {
+                free(comp); return -1;
+            }
+        } else {
+            /* Compressed size is not monotonic in length: a prefix can cost
+             * more than the whole block, because the codec picks its mode
+             * (stride, delta, hex folding, BWT, reference) from the entire
+             * content.  Writing the longer payload in place ran over whatever
+             * followed — for `@block` that is another file's reference table
+             * and store slab, and the container stopped opening at all while
+             * truncate still returned success.  Append it and move the block
+             * instead; the old bytes stay as garbage for compact to reclaim. */
+            off_t wo = (off_t)c->sb.inode_offset;
+            if (cfs_pw(c, comp, cl, wo) != (ssize_t)cl) { free(comp); return -1; }
+            lb_blk->offset = (uint64_t)wo;
+            c->sb.inode_offset = (uint64_t)wo + cl;
         }
-        e->raw.blocks[keep - 1].comp_size = (uint32_t)cl;
-        e->raw.blocks[keep - 1].orig_size = (uint32_t)rem;
+        lb_blk->comp_size = (uint32_t)cl;
+        lb_blk->orig_size = (uint32_t)rem;
         free(comp);
     }
 
@@ -1621,6 +1655,16 @@ static int cfs_block_write_impl(CFS *c, const void *buf, size_t size, off_t offs
             size_t ext = 0;
             if (b == nb - 1 && w1 > be) ext = (size_t)(w1 - be);
             if (po < pe || ext) {
+                /* One slot per block this write rewrites, and a device image
+                 * built by many small writes has many small blocks — the
+                 * array size is not a bound on how many a single write can
+                 * touch.  When the slots run out, rewrite the file whole
+                 * instead: slower, bounded, and it cannot corrupt the stack
+                 * the way running past pend_data[] did. */
+                if (np >= PEND_MAX) {
+                    for (int i = 0; i < np; i++) free(pend_data[i]);
+                    return block_write_fallback(c, src, size, w0, minsz, prev_sz);
+                }
                 if (block_patch(c, e, b, src, w0, po, pe, ext,
                                 pend_data, pend_idx, pend_cl, pend_orig, &np) != 0)
                     goto fail_pend;
@@ -1839,14 +1883,30 @@ static uint64_t dt_next_start(const CfsDedupTable *t, uint64_t off) {
 /* Store bytes written this session may still sit in the pending buffer, and
  * anything reading @store would read a hole there.  Flush only when the range
  * being read actually reaches into the unwritten tail. */
-static int dedup_pend_gate(CFS *c, uint64_t store_off) {
-    if (c->pend_n && store_off >= c->pend_off) return dedup_pend_flush(c);
+static int dedup_pend_gate(CFS *c, uint64_t store_off, size_t len) {
+    if (!c->pend_n) return 0;
+    /* Flush when the read *overlaps* the unflushed region, not only when it
+     * starts inside it.  Adjacent chunks merge into one reference, so a
+     * reference routinely begins on bytes already written and ends in the
+     * buffer that is still pending; comparing start offsets alone let that
+     * read through, it came back short, and data the caller had already
+     * written successfully read as missing until the next sync. */
+    uint64_t end = store_off + len;
+    if (end < store_off) return dedup_pend_flush(c);        /* wrapped */
+    if (store_off < c->pend_off + c->pend_n && end > c->pend_off)
+        return dedup_pend_flush(c);
     return 0;
 }
 
 static ssize_t dedup_read(CFS *c, InodeEntry *e, void *buf, size_t size, off_t offset) {
     if (size == 0) return 0;
     if (offset < 0 || (uint64_t)offset >= e->raw.orig_size) return 0;
+    /* A read returns everything already written, including bytes the merge
+     * layer is still holding: flush first rather than letting the per-
+     * reference gate decide.  Flushing mid-read left the references before
+     * the flush point pointing at bytes that had not been written yet, so the
+     * first read of a batch-written file returned its length but not its
+     * contents, and only the second read was right. */
     if (dt_load(c, e) != 0) return -1;
     size_t rem = size;
     if ((uint64_t)offset + rem > e->raw.orig_size)
@@ -1866,10 +1926,15 @@ static ssize_t dedup_read(CFS *c, InodeEntry *e, void *buf, size_t size, off_t o
         uint64_t within = cur - r->logical;
         size_t nl = (size_t)(r->length - within);
         if (nl > rem) nl = rem;
-        if (dedup_pend_gate(c, r->store + within) != 0) return -1;
-        if (cfs_read(c, CFS_STORE_PATH, (uint8_t*)buf + total, nl,
-                     (off_t)(r->store + within)) != (ssize_t)nl)
-            return total > 0 ? (ssize_t)total : -1;
+        if (dedup_pend_gate(c, r->store + within, nl) != 0) return -1;
+        { ssize_t _rr = cfs_read(c, CFS_STORE_PATH, (uint8_t*)buf + total, nl,
+                     (off_t)(r->store + within));
+          if (_rr != (ssize_t)nl)
+              fprintf(stderr, "DBG store read off=%llu nl=%zu rc=%zd pend_n=%zu pend_off=%llu\n",
+                      (unsigned long long)(r->store + within), nl, _rr, c->pend_n,
+                      (unsigned long long)c->pend_off);
+          if (_rr != (ssize_t)nl)
+            return total > 0 ? (ssize_t)total : -1; }
         /* A reference walked in full is one stored feature; its bytes are in
          * hand right here, so this is where the feature index comes from —
          * reconstruction feeds it, no separate scanning pass does. */
@@ -2304,7 +2369,7 @@ static int dedup_range_matches(CFS *c, const CfsDedupTable *t, const uint8_t *bu
         uint64_t within = (off + done) - r->logical;
         size_t take = (size_t)(r->length - within);
         if (take > n - done) take = n - done;
-        if (dedup_pend_gate(c, r->store + within) != 0) { same = 0; break; }
+        if (dedup_pend_gate(c, r->store + within, take) != 0) { same = 0; break; }
         if (cfs_read(c, CFS_STORE_PATH, tmp, take,
                      (off_t)(r->store + within)) != (ssize_t)take) { same = 0; break; }
         if (memcmp(tmp, buf + done, take) != 0) same = 0;
