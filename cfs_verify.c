@@ -393,7 +393,13 @@ static void check_blocks(VCtx *v, const VInode *in, uint32_t idx) {
             vprob(v, C_BLK, 0, "inode %u \"%s\": directory with %u block(s) — unreachable bytes",
                   idx, nm, (unsigned)in->nblk);
     } else {   /* FILE / SYMLINK: blocks are content */
-        if (in->orig && !in->nblk)
+        /* @block is exempt from the block_count==0 check: a device created
+         * and resized but never written (cfs_create + cfs_block_resize) is
+         * legal — the block layer zero-fills every byte of the declared
+         * capacity, so a read returns a full device of zeros.  Requiring real
+         * blocks would flag an untouched sparse device as corrupt. */
+        if (in->orig && !in->nblk &&
+            (!in->path || strcmp(in->path, "@block") != 0))
             vprob(v, C_BLK, 1, "inode %u \"%s\": orig_size=%llu but block_count=0 (no way to read it)",
                   idx, nm, (unsigned long long)in->orig);
         if (!in->orig && in->nblk)
@@ -538,14 +544,21 @@ static void deep_crosscheck(VCtx *v, CFS *c, const VInode *in,
                             const CfsDedupTable *t, const VInode *store) {
     const char *nm = in->path;
     const size_t CH = 1u << 20;
+    /* @block is a device, not a file: the library's view of it is
+     * cfs_block_read(), which zero-fills the unwritten tail.  Plain cfs_read()
+     * returns 0 there (the inode has no content blocks), which is why an
+     * untouched sparse device used to fail this cross-check. */
+    int is_dev = (nm && !strcmp(nm, "@block"));
     uint8_t *a = malloc(CH), *b = malloc(CH);
     if (!a || !b) { free(a); free(b); return; }
     for (uint64_t off = 0; off < in->orig; off += CH) {
         size_t n = (size_t)(in->orig - off < CH ? in->orig - off : CH);
-        ssize_t got = cfs_read(c, nm, a, n, (off_t)off);
+        ssize_t got = is_dev ? cfs_block_read(c, a, n, (off_t)off)
+                             : cfs_read(c, nm, a, n, (off_t)off);
         if (got != (ssize_t)n) {
-            vprob(v, C_DEEP, 1, "\"%s\": cfs_read(%zu @ %llu) returned %lld, expected %zu",
-                  nm, n, (unsigned long long)off, (long long)got, n);
+            vprob(v, C_DEEP, 1, "\"%s\": %s(%zu @ %llu) returned %lld, expected %zu",
+                  nm, is_dev ? "cfs_block_read" : "cfs_read", n,
+                  (unsigned long long)off, (long long)got, n);
             break;
         }
         /* Independent resolution: table lookup in @store, holes as zeros. */
@@ -556,6 +569,17 @@ static void deep_crosscheck(VCtx *v, CFS *c, const VInode *in,
                 if (!rf) {
                     uint64_t nx = vnext_start(t, cur);
                     if (nx > end) nx = end;
+                    /* A table truncated below the inode's orig_size makes
+                     * vnext_start() return `cur` at its end: the zero-fill
+                     * below would advance by 0 and spin forever (and, before
+                     * the size clamp, underflow the memset length).  Stop;
+                     * check_dedup() has already reported the size mismatch. */
+                    if (nx <= cur) {
+                        vprob(v, C_DEEP, 1, "\"%s\": reference table has no tuple at logical %llu "
+                              "(table is shorter than the file)", nm,
+                              (unsigned long long)cur);
+                        break;
+                    }
                     memset(b + done, 0, (size_t)(nx - cur));
                     done += (size_t)(nx - cur); cur = nx;
                     continue;

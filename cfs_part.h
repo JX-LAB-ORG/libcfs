@@ -20,6 +20,11 @@
 #define MBR_TYPE_SWAP      0x82
 #define MBR_TYPE_NTFS      0x07
 
+/* LBA where the first MBR partition may start.  Everything below (the MBR
+ * itself lives in LBA0) belongs to the partition table: a partition that
+ * covered it would let an ordinary write erase the table. */
+#define MBR_FIRST_USABLE   2048          /* 1MiB */
+
 typedef struct {
     uint8_t  status;
     uint8_t  chs_first[3];
@@ -39,6 +44,9 @@ typedef struct {
 #define GPT_TABLE_BYTES    (34 * 512)                            /* LBA0-33 */
 #define GPT_BACKUP_SECTORS 33                                    /* backup entries + header */
 #define GPT_MIN_DISK_SECT  67                                    /* 34 + 33 */
+/* Last usable LBA is disk_sectors - GPT_LAST_USABLE_RESERVE: the backup
+ * entry array (32 sectors) and backup header (1) follow it at the tail. */
+#define GPT_LAST_USABLE_RESERVE 34
 
 typedef struct {
     char     sig[8];          /* "EFI PART" */

@@ -225,19 +225,37 @@ int creat(const char *p, mode_t m) { return open(p, O_CREAT|O_WRONLY|O_TRUNC, m)
 /* ═══════════════════════════════════════════════════════════════
    read / pread
    ═══════════════════════════════════════════════════════════════ */
+/* A partition device is bounded by its own size, not by the disk's.  Every
+ * partition I/O goes through this clamp: without it, a read at offset ==
+ * psize returns the neighbouring partition's bytes and a write there writes
+ * into it.  The whole-disk fd is left alone — cfs_block_write already
+ * refuses past its declared capacity with ENOSPC, and that promise (and its
+ * errno) is what the guest sees. */
+static size_t blk_clamp(const BlkFd *bf, uint64_t pos, size_t n) {
+    if (!bf->part) return n;
+    if (pos >= bf->psize) return 0;
+    uint64_t left = bf->psize - pos;
+    return (uint64_t)n > left ? (size_t)left : n;
+}
+
 ssize_t read(int fd, void *buf, size_t n) {
     BlkFd *bf = blk_fd_get(fd);
     if (!bf) { LOAD(_r, "read"); return _r(fd, buf, n); }
-    ssize_t nr = cfs_block_read(blk_cfs, buf, n, (off_t)(bf->pstart + (uint64_t)bf->pos));
-    _DBG("READ fd=%d n=%zu off=%lld → %zd", fd, n, (long long)bf->pos, nr);
+    size_t want = blk_clamp(bf, (uint64_t)bf->pos, n);
+    if (want == 0) { _DBG("READ fd=%d n=%zu off=%lld → 0 (eof)", fd, n, (long long)bf->pos); return 0; }
+    ssize_t nr = cfs_block_read(blk_cfs, buf, want, (off_t)(bf->pstart + (uint64_t)bf->pos));
+    _DBG("READ fd=%d n=%zu off=%lld → %zd", fd, want, (long long)bf->pos, nr);
     if (nr > 0) bf->pos += nr;
     return nr;
 }
 ssize_t pread(int fd, void *buf, size_t n, off_t off) {
     BlkFd *bf = blk_fd_get(fd);
     if (!bf) { static ssize_t (*_pr)(int,void*,size_t,off_t); LOAD(_pr, "pread"); return _pr(fd, buf, n, off); }
-    ssize_t nr = cfs_block_read(blk_cfs, buf, n, (off_t)(bf->pstart + (uint64_t)off));
-    _DBG("PREAD fd=%d off=%lld n=%zu → %zd", fd, (long long)off, n, nr);
+    if (off < 0) { errno = EINVAL; return -1; }
+    size_t want = blk_clamp(bf, (uint64_t)off, n);
+    if (want == 0) { _DBG("PREAD fd=%d off=%lld → 0 (eof)", fd, (long long)off); return 0; }
+    ssize_t nr = cfs_block_read(blk_cfs, buf, want, (off_t)(bf->pstart + (uint64_t)off));
+    _DBG("PREAD fd=%d off=%lld n=%zu → %zd", fd, (long long)off, want, nr);
     return nr;
 }
 ssize_t pread64(int fd, void *b, size_t n, off_t o) { return pread(fd, b, n, o); }
@@ -254,11 +272,14 @@ static void blk_wfail(void) { errno = (errno == ENOSPC) ? ENOSPC : EIO; }
 ssize_t write(int fd, const void *buf, size_t n) {
     BlkFd *bf = blk_fd_get(fd);
     if (!bf) { LOAD(_w, "write"); return _w(fd, buf, n); }
-    _DBG("WRITE fd=%d n=%zu off=%lld", fd, n, (long long)bf->pos);
     /* Short writes are normal for a device that ran out of room: land what
      * fits and report that count, the way a real disk does, instead of
-     * failing a write whose early part is already on the platter. */
-    ssize_t got = cfs_block_write_some(blk_cfs, buf, n, (off_t)(bf->pstart + (uint64_t)bf->pos));
+     * failing a write whose early part is already on the platter.  The
+     * partition boundary is another such limit: never cross it. */
+    size_t want = blk_clamp(bf, (uint64_t)bf->pos, n);
+    _DBG("WRITE fd=%d n=%zu off=%lld (clamped %zu)", fd, n, (long long)bf->pos, want);
+    if (want == 0) return 0;
+    ssize_t got = cfs_block_write_some(blk_cfs, buf, want, (off_t)(bf->pstart + (uint64_t)bf->pos));
     if (got < 0) { blk_wfail(); return -1; }
     bf->pos += (off_t)got;
     return got;
@@ -266,8 +287,11 @@ ssize_t write(int fd, const void *buf, size_t n) {
 ssize_t pwrite(int fd, const void *buf, size_t n, off_t off) {
     BlkFd *bf = blk_fd_get(fd);
     if (!bf) { static ssize_t (*_pw)(int,const void*,size_t,off_t); LOAD(_pw, "pwrite"); return _pw(fd, buf, n, off); }
-    _DBG("PWRITE fd=%d off=%lld n=%zu", fd, (long long)off, n);
-    ssize_t got = cfs_block_write_some(blk_cfs, buf, n, (off_t)(bf->pstart + (uint64_t)off));
+    if (off < 0) { errno = EINVAL; return -1; }
+    size_t want = blk_clamp(bf, (uint64_t)off, n);
+    _DBG("PWRITE fd=%d off=%lld n=%zu (clamped %zu)", fd, (long long)off, n, want);
+    if (want == 0) return 0;
+    ssize_t got = cfs_block_write_some(blk_cfs, buf, want, (off_t)(bf->pstart + (uint64_t)off));
     if (got < 0) { blk_wfail(); return -1; }
     return got;
 }
@@ -545,7 +569,10 @@ void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
     if (!bf) { static typeof(mmap)*_mm; if (!_mm) _mm = (typeof(_mm))dlsym(RTLD_NEXT, "mmap"); return _mm(addr, len, prot, flags, fd, off); }
     void *p = (void*)syscall(SYS_mmap, addr, len, PROT_READ|PROT_WRITE, MAP_ANONYMOUS|MAP_PRIVATE, -1, 0);
     if (p == MAP_FAILED) return p;
-    cfs_block_read(blk_cfs, p, len, (off_t)(bf->pstart + (uint64_t)off));
+    /* Same boundary as read(2): the anonymous mapping is already zeroed, so
+     * only the in-partition prefix is filled. */
+    size_t want = blk_clamp(bf, (uint64_t)off, len);
+    if (want) cfs_block_read(blk_cfs, p, want, (off_t)(bf->pstart + (uint64_t)off));
     if (!(prot & PROT_WRITE)) syscall(SYS_mprotect, p, len, prot);
     return p;
 }

@@ -124,6 +124,10 @@ int     cfs_block_write(CFS *cfs, const void *buf, size_t size, off_t offset);
  * write. */
 ssize_t cfs_block_write_some(CFS *cfs, const void *buf, size_t size, off_t offset);
 uint64_t cfs_block_size(CFS *cfs);
+/* Grow-only: extends the declared device capacity.  A size below the current
+ * one is refused with EINVAL — shrinking would strand the blocks past the new
+ * end (nothing reclaims them), so reporting success for it would claim a
+ * shrink that never happened. */
 int     cfs_block_resize(CFS *cfs, uint64_t size);
 
 /* ─── Disk identity ────────────────────────────────────────────

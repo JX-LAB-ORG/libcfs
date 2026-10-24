@@ -69,12 +69,14 @@ static void test_rejections(void) {
     CHK(cfs_part_add(c, 1000, 4096, 0x83, NULL, 0) < 0, "misaligned start");
     CHK(cfs_part_add(c, 4096, 1000, 0x83, NULL, 0) < 0, "misaligned size");
     CHK(cfs_part_add(c, DISK_SZ, 4096, 0x83, NULL, 0) < 0, "out of disk");
-    CHK(cfs_part_add(c, 0, 4096, 0x83, NULL, 0) == 1, "first at 0");
-    CHK(cfs_part_add(c, 2048, 4096, 0x83, NULL, 0) < 0, "overlap");
-    CHK(cfs_part_add(c, 8192, 4096, 0x83, NULL, 0) == 2, "second ok");
-    CHK(cfs_part_add(c, 12288, 4096, 0x83, NULL, 0) == 3, "third ok");
-    CHK(cfs_part_add(c, 16384, 4096, 0x83, NULL, 0) == 4, "fourth ok");
-    CHK(cfs_part_add(c, 20480, 4096, 0x83, NULL, 0) < 0, "fifth rejected (MBR 4 max)");
+    /* LBA0-3 belong to the table: a partition must start at 1MiB or later. */
+    CHK(cfs_part_add(c, 0, 4096, 0x83, NULL, 0) < 0, "at LBA0 rejected");
+    CHK(cfs_part_add(c, 1ULL << 20, 4096, 0x83, NULL, 0) == 1, "first at 1MiB");
+    CHK(cfs_part_add(c, (1ULL << 20) + 2048, 4096, 0x83, NULL, 0) < 0, "overlap");
+    CHK(cfs_part_add(c, (1ULL << 20) + 8192, 4096, 0x83, NULL, 0) == 2, "second ok");
+    CHK(cfs_part_add(c, (1ULL << 20) + 16384, 4096, 0x83, NULL, 0) == 3, "third ok");
+    CHK(cfs_part_add(c, (1ULL << 20) + 24576, 4096, 0x83, NULL, 0) == 4, "fourth ok");
+    CHK(cfs_part_add(c, (1ULL << 20) + 32768, 4096, 0x83, NULL, 0) < 0, "fifth rejected (MBR 4 max)");
     cfs_close(c);
     unlink(PATH);
 }
@@ -85,13 +87,13 @@ static void test_del_shift(void) {
     CHK(c != NULL, "create");
     if (!c) return;
     cfs_part_label(c, CFS_PART_MBR);
-    cfs_part_add(c, 4096, 4096, 0x83, NULL, 0);
-    cfs_part_add(c, 8192, 4096, 0x0C, NULL, 0);
-    cfs_part_add(c, 12288, 4096, 0x83, NULL, 0);
+    cfs_part_add(c, 1ULL << 20, 4096, 0x83, NULL, 0);
+    cfs_part_add(c, (1ULL << 20) + 4096, 4096, 0x0C, NULL, 0);
+    cfs_part_add(c, (1ULL << 20) + 8192, 4096, 0x83, NULL, 0);
 
     CHK(cfs_part_del(c, 2) == 0, "del 2");
     CfsPartition p;
-    CHK(cfs_part_get(c, 2, &p) == 0 && p.mbr_type == 0x83 && p.start == 12288, "old 3 shifted to 2");
+    CHK(cfs_part_get(c, 2, &p) == 0 && p.mbr_type == 0x83 && p.start == (1ULL << 20) + 8192, "old 3 shifted to 2");
     CHK(cfs_part_get(c, 3, &p) != 0, "no 3 anymore");
     CHK(cfs_part_count(c) == 2, "count 2");
     cfs_close(c);
@@ -168,7 +170,7 @@ static void test_cache_invalidation(void) {
     CHK(c != NULL, "create");
     if (!c) return;
     cfs_part_label(c, CFS_PART_MBR);
-    cfs_part_add(c, 4096, 4096, 0x83, NULL, 0);
+    cfs_part_add(c, 1ULL << 20, 4096, 0x83, NULL, 0);
     CHK(cfs_part_count(c) == 1, "cached count 1");
 
     /* scribble zeros over the MBR */

@@ -136,7 +136,7 @@ int main(void) {
         if (!c) return 1;
         cfs_block_resize(c, 33 * 1024 * 1024);
         CHECK(cfs_part_label(c, CFS_PART_MBR) == 0, "B partlabel");
-        int ar = cfs_part_add(c, 2048, 32 * 1024 * 1024 / 512 - 2048, 0x83, NULL, 0);
+        int ar = cfs_part_add(c, 1 * 1024 * 1024, 32 * 1024 * 1024, 0x83, NULL, 0);
         printf("B partadd rc=%d disk=%llu\n", ar, (unsigned long long)cfs_block_size(c));
         CHECK(ar >= 1, "B partadd (rc=%d)", ar);
 

@@ -22,7 +22,12 @@ int cfs_mkfs_swap_at(CFS *c, uint64_t base_off, uint64_t size) {
     if (!c || size < SWAP_MIN_SIZE || base_off % SWAP_PAGE_SIZE) return -1;
     /* Capacity first: cfs_block_write refuses anything past the declared
      * size, so the formatter must declare it before it writes. */
-    if (cfs_block_resize(c, base_off + size) != 0) return -1;
+    /* Grow to fit, but never pass a size below the current capacity: resize
+     * is grow-only (a smaller request is refused), and the caller may have
+     * declared a device slightly larger than this partition — the GPT tail
+     * reserves 34 sectors for the backup table. */
+    if (cfs_block_size(c) < base_off + size &&
+        cfs_block_resize(c, base_off + size) != 0) return -1;
 
     /* Linux swap_header_v1 layout inside page 0:
      *   bootbits[1024] | version(1) @1024 | last_page @1028 |

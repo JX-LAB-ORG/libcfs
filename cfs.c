@@ -236,6 +236,10 @@ int cfs_add_file(CFS *c, const char *vpath, const void *buf, size_t size) {
 
     off_t write_off = (off_t)c->sb.inode_offset;
     if(cfs_pw(c,comp,cl,write_off)!=(ssize_t)cl){free(comp);return -1;}
+    /* Move the append cursor past the block, so a sync that flushes pending
+     * @store bytes cannot land them on top of it (see cfs_write). */
+    c->sb.inode_offset = (uint64_t)write_off + cl;
+    c->sb.inode_size = 0;
 
     InodeEntry *na=realloc(c->inodes,(c->inode_count+1)*sizeof(InodeEntry));
     if(!na){free(comp);return -1;} c->inodes=na;
@@ -705,6 +709,16 @@ int cfs_write(CFS *c, const char *path, const void *buf, size_t size) {
         return -1;
     }
 
+    /* Advance the append cursor past the blocks just written.  cfs_sync()
+     * flushes pending @store bytes *before* it writes the inode table, and it
+     * appends them through this cursor: leaving it at the old table position
+     * made the store slab land on top of the block appended here, which broke
+     * both the block and (once the block table pointed at the overwritten
+     * header) the container's ability to open at all.  Every other appender
+     * (store_append, dedup_write_table, truncate, gc) already moves it. */
+    c->sb.inode_offset = cur_off;
+    c->sb.inode_size = 0;
+
     e->raw.orig_size   = size;
     e->raw.mtime       = (uint64_t)time(NULL);
     e->raw.mode        = CFS_MODE_FILE;
@@ -791,6 +805,21 @@ int cfs_unlink(CFS *c, const char *path) {
                     }
                 }
             }
+            /* The table cache is keyed by path.  If it still names this path,
+             * drop it: the entry is going away, so its edits (dirty or not)
+             * are irrelevant — and a later entry created under the same name
+             * (unlink "a" + rename "b" -> "a") would otherwise be read
+             * through the deleted file's table and return its content. */
+            if (c->dt_path && !strcmp(c->dt_path, path)) dedup_cache_drop(c);
+            /* Finish any buffered work before mutating the table.  cfs_sync()
+             * below would otherwise be the first place the pending @store
+             * bytes are attempted, and a quota refusal there came *after* the
+             * entry had been removed in memory — and, when store_ensure()
+             * still synced, after a nested sync had committed the removal to
+             * disk — so the call reported failure for a change already
+             * applied.  A refusal here leaves memory and disk untouched. */
+            if ((c->pend_n || c->dt_dirty || c->dirty) && cfs_sync(c) != 0)
+                return -1;
             /* Free and shift remaining entries.  The removed entry's block
              * table has to go too: the memmove overwrites the slot without
              * freeing what it held, which leaked one block array per unlink
@@ -960,6 +989,9 @@ int cfs_symlink(CFS *c, const char *target, const char *linkpath) {
     if (cfs_pw(c, hdr, CPENC_HEADER_SIZE + 1, wo) != CPENC_HEADER_SIZE + 1 ||
         cfs_pw(c, target, tl, wo + CPENC_HEADER_SIZE + 1) != (ssize_t)tl)
         { free(e->path); c->inode_count--; return -1; }
+    /* Same cursor discipline as every other appender (see cfs_write). */
+    c->sb.inode_offset = (uint64_t)wo + CPENC_HEADER_SIZE + 1 + tl;
+    c->sb.inode_size = 0;
 
     e->raw.orig_size   = tl;
     e->raw.mtime       = (uint64_t)time(NULL);
@@ -990,6 +1022,21 @@ int cfs_rename(CFS *c, const char *oldpath, const char *newpath) {
     InodeEntry *e = lu(c, oldpath);
     if (!e) { errno = ENOENT; return -1; }
     if (lu(c, newpath)) { errno = EEXIST; return -1; }
+
+    /* Pending reference-table edits are found by the path the cache was
+     * loaded under.  Renaming first would make dedup_table_flush() look the
+     * old name up, find nothing and silently discard the edits — so flush
+     * before the path changes.  Doing it first also means the sync at the end
+     * has only metadata left to write, so a quota refusal cannot come after
+     * the rename has been applied (and committed by store_ensure's nested
+     * sync) while this call reports failure. */
+    if ((c->pend_n || c->dt_dirty || c->dirty) && cfs_sync(c) != 0) return -1;
+    /* The flush can create @store and realloc the inode array. */
+    e = lu(c, oldpath);
+    if (!e) { errno = ENOENT; return -1; }
+    /* Any cached table is keyed by a name this call changes (for a directory,
+     * a whole prefix of names); let the next access reload from disk. */
+    if (c->dt_path) dedup_cache_drop(c);
 
     size_t opl = strlen(oldpath), npl = strlen(newpath);
     int is_dir = (e->raw.mode == CFS_MODE_DIR);
@@ -1484,6 +1531,19 @@ ssize_t cfs_block_write_some(CFS *c, const void *buf, size_t size, off_t offset)
 }
 
 int cfs_block_write(CFS *c, const void *buf, size_t size, off_t offset) {
+    if (!c || !buf || size == 0 || offset < 0) return -1;
+    /* All-or-nothing, as cfs.h promises: a request whose end lies past the
+     * declared capacity has to fail before the first 8MB segment is written.
+     * cfs_block_write_some() stops at the first refused piece, which is the
+     * right contract for a guest-facing short write but not for this one — it
+     * returned -1 after part of the buffer had already landed. */
+    {
+        uint64_t w1 = (uint64_t)offset + (uint64_t)size;
+        if (w1 < (uint64_t)offset || w1 > cfs_block_size(c)) {
+            errno = ENOSPC;
+            return CFS_ENOSPC;      /* the code cfs.h documents for this case */
+        }
+    }
     return cfs_block_write_some(c, buf, size, offset) == (ssize_t)size ? 0 : -1;
 }
 
@@ -1590,7 +1650,11 @@ static int cfs_block_write_impl(CFS *c, const void *buf, size_t size, off_t offs
          * 746-byte container into a 2GB allocation and eight seconds of
          * work (fuzzing found both).  The total is still capped — that is a
          * time bound, not a memory one. */
-        if (pad > BLOCK_CHUNK) {
+        if (pad >= BLOCK_CHUNK) {
+            /* >=, not >: a pad of exactly BLOCK_CHUNK packed together with the
+             * write produced a block of BLOCK_CHUNK + size, contradicting the
+             * "no block exceeds BLOCK_CHUNK" invariant this branch exists to
+             * uphold.  A full chunk of zeros belongs in its own block. */
             if (pad > (1ULL << 30)) { errno = ENOSPC; return -1; }
             uint8_t *z = calloc(1, BLOCK_CHUNK);
             if (!z) return -1;
@@ -1727,6 +1791,13 @@ static int cfs_block_write_impl(CFS *c, const void *buf, size_t size, off_t offs
         }
         nb += (uint32_t)hi;
         e->raw.block_count = nb;
+        /* Advance the cursor past the slabs just appended, for the same
+         * reason cfs_write() does: cfs_sync() flushes pending @store bytes
+         * through this cursor before it writes the inode table, and a cursor
+         * left at the old table position would put them on top of the block
+         * that was just appended here. */
+        c->sb.inode_offset = app;
+        c->sb.inode_size = 0;
     }
 
     uint64_t want = prev_sz > minsz ? prev_sz : minsz;
@@ -1779,6 +1850,11 @@ int cfs_block_resize(CFS *c, uint64_t size) {
     if(block_ensure(c, 0)!=0) return -1;
     InodeEntry *e = lu(c, BLOCK_PATH);
     if(!e) return -1;
+    /* Grow-only.  Shrinking would leave the blocks past the new end holding
+     * bytes the device no longer exposes, and nothing here reclaims them —
+     * the old code simply ignored the request and returned success, which
+     * told the caller the device had shrunk when it had not. */
+    if(size < e->raw.orig_size) { errno = EINVAL; return -1; }
     /* Just extend the declared size — don't clear data blocks */
     if(size > e->raw.orig_size) e->raw.orig_size = size;
     return cfs_sync(c);
@@ -1917,6 +1993,12 @@ static ssize_t dedup_read(CFS *c, InodeEntry *e, void *buf, size_t size, off_t o
         const CfsRef *r = cfs_dedup_table_find(&c->dt, cur);
         if (!r) {                       /* hole — same semantics as a plain file */
             uint64_t next = dt_next_start(&c->dt, cur);
+            /* A table that stops short of the inode's orig_size (cur is at or
+             * past logical_size) makes dt_next_start() return `cur` itself:
+             * nl was 0 and this loop never advanced, so a read of a crafted
+             * or truncated table spun forever.  Stop and say the table is
+             * short (the verifier reports the same inconsistency). */
+            if (next <= cur) return total > 0 ? (ssize_t)total : -1;
             size_t nl = (size_t)(next - cur);
             if (nl > rem) nl = rem;
             memset((uint8_t*)buf + total, 0, nl);
@@ -1948,8 +2030,26 @@ static ssize_t dedup_read(CFS *c, InodeEntry *e, void *buf, size_t size, off_t o
 static InodeEntry *store_ensure(CFS *c) {
     InodeEntry *e = lu(c, CFS_STORE_PATH);
     if (e) return e;
-    if (cfs_write(c, CFS_STORE_PATH, NULL, 0) != 0) return NULL;
-    return lu(c, CFS_STORE_PATH);
+    /* Create the entry in memory only.  cfs_write(path, "", 0) would sync,
+     * and that sync writes the inode table — which already contains the
+     * caller's new references — before the store bytes they point at have
+     * been appended.  If the append is then refused (quota) the container is
+     * left resolving into a hole while the caller is told it failed, and the
+     * caller's caller may already have dropped the bytes.  The caller's own
+     * sync (store_append's tail) writes the table once the bytes are there. */
+    InodeEntry *na = realloc(c->inodes, (c->inode_count + 1) * sizeof(InodeEntry));
+    if (!na) return NULL;
+    c->inodes = na;
+    e = &c->inodes[c->inode_count++];
+    memset(e, 0, sizeof(*e));
+    e->path = strdup(CFS_STORE_PATH);
+    if (!e->path) { c->inode_count--; return NULL; }
+    e->raw.orig_size = 0;
+    e->raw.mtime     = (uint64_t)time(NULL);
+    e->raw.mode      = CFS_MODE_FILE;
+    e->raw.path_len  = (uint16_t)strlen(CFS_STORE_PATH);
+    c->dirty = 1;      /* the table now has an entry that is not on disk yet */
+    return e;
 }
 
 /* Append len bytes to @store; *out_off receives where they landed. */
@@ -1983,6 +2083,10 @@ static int store_append(CFS *c, const uint8_t *buf, size_t len, uint64_t *out_of
     uint64_t off = c->sb.inode_offset;
     for (uint32_t i = 0; i < nb; i++) {
         if (cfs_pw(c, data[i], cl[i], (off_t)off) != (ssize_t)cl[i]) {
+            /* Roll the reserved slots back: their bytes never landed, so the
+             * block table must not describe them.  Slots already written are
+             * unreferenced garbage until GC. */
+            e->raw.block_count = old;
             free_pieces(data, cl, ol, nb, i); return -1;
         }
         e->raw.blocks[old + i].offset    = off;
@@ -2229,15 +2333,28 @@ static int dedup_pend_ready(CFS *c) {
 
 static int dedup_pend_flush(CFS *c) {
     if (!c->pend_n) return 0;
-    /* Clear before appending: store_append() syncs, and cfs_sync() re-enters
-     * here — with the count still set that would recurse forever. */
+    /* store_append() ends with cfs_sync(), which re-enters here.  By then the
+     * append has landed and there is nothing left to flush; without this
+     * guard the flush would recurse (the count is deliberately kept until the
+     * append succeeds). */
+    if (c->pend_flushing) return 0;
+    /* The count and the cursor are cleared only once the append has actually
+     * landed.  Clearing the count first is what lost data: the reference
+     * table written before this sync already points at these bytes, so a
+     * refused append left the container with references past @store, and the
+     * next close/sync committed them.  On failure the buffer stays exactly as
+     * it was and the next sync retries. */
     size_t n = c->pend_n;
     uint64_t want = c->pend_off;
-    c->pend_n = 0;
     uint64_t soff = 0;
-    if (store_append(c, c->pend_buf, n, &soff) != 0) return -1;
+    c->pend_flushing = 1;
+    int rc = store_append(c, c->pend_buf, n, &soff);
+    c->pend_flushing = 0;
+    if (rc != 0) return rc;
+    /* The bytes are on disk now whatever the landing-offset check says. */
+    c->pend_n = 0;
+    c->pend_off = soff + n;
     if (soff != want) return -1;        /* predicted landing offset must hold */
-    c->pend_off += n;
     return 0;
 }
 
@@ -2391,6 +2508,10 @@ ssize_t cfs_dedup_write(CFS *c, const char *path, const void *vbuf, size_t size,
     uint64_t off = (uint64_t)offset;
 
     if (dedup_range_matches(c, &c->dt, buf, off, size)) return (ssize_t)size;
+    /* The match check flushes pending store bytes, which can create @store
+     * and realloc c->inodes; the `e` resolved above is not valid across it. */
+    e = lu(c, path);
+    if (!e) return -1;
 
     /* Reserve for the whole write before touching anything.  The loop below
      * emits and references one chunk at a time, so a refusal in the middle
@@ -2434,6 +2555,11 @@ ssize_t cfs_dedup_write(CFS *c, const char *path, const void *vbuf, size_t size,
         if (dedup_table_put(&c->dt, off + done, clen, soff) != 0) goto rollback;
         done += clen;
     }
+    /* dedup_emit() can flush, and a flush can create @store and realloc
+     * c->inodes: re-resolve before touching the entry (this was a
+     * use-after-free that ASan caught writing the mtime into a freed slot). */
+    e = lu(c, path);
+    if (!e) goto rollback;
     if (off + size > e->raw.orig_size) e->raw.orig_size = off + size;
     e->raw.mtime = (uint64_t)time(NULL);
     c->dt_dirty = 1;
@@ -2773,6 +2899,14 @@ int cfs_dedup_gc(CFS *c, CfsDedupGcStats *out) {
             s2->raw.mtime = (uint64_t)time(NULL);
             te->raw.blocks = NULL;                /* old store bytes are orphaned */
             te->raw.block_count = 0;
+            /* @store is now a different, shorter stream, so the pending
+             * buffer's append cursor has to follow it.  Nothing can be
+             * pending here — gc synced on entry, and the re-merge above
+             * flushed — but the cursor is where the *next* write stages its
+             * store offsets: left at the old, larger size, every later
+             * dedup_emit() would reference bytes past the new store end, the
+             * write would still report success, and the reads would fail. */
+            c->pend_off = s2->raw.orig_size;
             cfs_unlink(c, tmp_path);
         }
     }

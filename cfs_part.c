@@ -85,6 +85,19 @@ static const char *gpt_type_name(const uint8_t g[16]) {
     if (!memcmp(g, GPT_GUID_SWAP,  16)) return "swap";
     return NULL;
 }
+/* MBR-style type byte -> the GPT type GUID the same name means.  Shared by
+ * partadd and parttype so the two cannot drift apart (parttype used to be a
+ * silent no-op on GPT because the CLI passes guid=NULL). */
+static const uint8_t *gpt_guid_for_type(uint8_t mbr_type, const char **name) {
+    switch (mbr_type) {
+    case MBR_TYPE_EFI:  *name = "efi";      return GPT_GUID_EFI;
+    case MBR_TYPE_SWAP: *name = "swap";     return GPT_GUID_SWAP;
+    case MBR_TYPE_FAT16:
+    case MBR_TYPE_FAT32:
+    case MBR_TYPE_NTFS: *name = "ms-basic"; return GPT_GUID_MS;
+    default:            *name = "linux";    return GPT_GUID_LINUX;
+    }
+}
 
 /* ── MBR parse/build ───────────────────────────────────────────── */
 static int mbr_parse(const uint8_t *sec, CfsPartition *out, int max) {
@@ -118,8 +131,21 @@ static void mbr_chs(uint32_t lba, uint8_t chs[3]) {
     chs[2] = (uint8_t)(c & 0xFF);
 }
 
-static void mbr_build(uint8_t *sec, const CfsPartition *parts, int n) {
+/* MBR partition entries carry 32-bit LBA fields.  Building the sector with a
+ * truncated value is worse than refusing: a 4TiB disk with a partition at
+ * LBA 2^32 parses back as LBA 0, and a 2^32-sector partition parses back as
+ * size 0 (it disappears from the table).  Validate the whole range first. */
+static int mbr_build(uint8_t *sec, const CfsPartition *parts, int n) {
     memset(sec, 0, MBR_SECTOR_SIZE);
+    for (int i = 0; i < n && i < MBR_PART_ENTRIES; i++) {
+        uint64_t start = parts[i].start / MBR_SECTOR_SIZE;
+        uint64_t sectors = parts[i].size / MBR_SECTOR_SIZE;
+        if (start > 0xFFFFFFFFull || sectors == 0 || sectors > 0xFFFFFFFFull ||
+            start + sectors - 1 > 0xFFFFFFFFull) {
+            memset(sec, 0, MBR_SECTOR_SIZE);
+            return -1;
+        }
+    }
     for (int i = 0; i < n && i < MBR_PART_ENTRIES; i++) {
         MbrEntry *e = (MbrEntry *)(sec + MBR_PART_OFF + i * MBR_PART_ENTRY_SZ);
         memset(e, 0, sizeof(*e));
@@ -136,6 +162,7 @@ static void mbr_build(uint8_t *sec, const CfsPartition *parts, int n) {
     }
     sec[MBR_SIG_OFF] = MBR_SIG_HI;
     sec[MBR_SIG_OFF + 1] = MBR_SIG_LO;
+    return 0;
 }
 
 /* ── GPT parse/build ───────────────────────────────────────────── */
@@ -158,10 +185,14 @@ static int gpt_parse(const uint8_t *table, size_t table_len,
 
     uint32_t num = le32r((const uint8_t *)&h->num_entries);
     uint32_t esz = le32r((const uint8_t *)&h->entry_size);
-    if (num > GPT_ENTRIES_MAX || esz < 128) { return -1; }
+    /* The entry array must fit in the 32 sectors this parser read.  Trusting
+     * num/esz independently let `num * esz` walk past the heap buffer while
+     * the CRC was still computed over the fixed 16KiB. */
+    if (num > GPT_ENTRIES_MAX || esz < GPT_ENTRY_SIZE || esz % GPT_ENTRY_SIZE) { return -1; }
+    if ((uint64_t)num * esz > GPT_ENTRIES_BYTES) { return -1; }
 
     const uint8_t *ep = table + 512 + 512;   /* LBA2 */
-    uint32_t ent_crc = cfs_crc32(ep, GPT_ENTRIES_BYTES);
+    uint32_t ent_crc = cfs_crc32(ep, (size_t)num * esz);
     if (ent_crc != le32r((const uint8_t *)&h->entries_crc)) { return -1; }
 
     int n = 0;
@@ -243,7 +274,11 @@ static void gpt_build(uint8_t *lba0, uint8_t *hdr, uint8_t *entries,
     le64w((uint8_t *)(hdr + 24), 1);
     le64w((uint8_t *)(hdr + 32), disk_sectors - 1);
     le64w((uint8_t *)(hdr + 40), GPT_FIRST_USABLE);
-    le64w((uint8_t *)(hdr + 48), disk_sectors - GPT_FIRST_USABLE - GPT_BACKUP_SECTORS - 1);
+    /* Inclusive last LBA a partition may use: the backup entries (32
+     * sectors) and backup header (1) occupy everything after it.  The old
+     * formula reserved 34 sectors too many and disagreed with the bounds
+     * cfs_part_add now enforces. */
+    le64w((uint8_t *)(hdr + 48), disk_sectors - GPT_LAST_USABLE_RESERVE);
     memset(hdr + 56, 0, 16);   /* disk guid: zero (not user-visible in v1) */
     le64w((uint8_t *)(hdr + 72), GPT_ENTRIES_LBA);
     le32w((uint8_t *)(hdr + 80), GPT_ENTRIES_MAX);
@@ -281,51 +316,113 @@ static int part_load(CFS *c) {
 }
 
 /* ── Table save ────────────────────────────────────────────────── */
+/* GPT is written so that a reader always finds one complete table:
+ *
+ *   1. backup entry array + backup header   (one write)
+ *   2. primary header + entry array         (one write, at LBA1..LBA33)
+ *   3. protective MBR                       (one write, at LBA0)
+ *
+ * The old code wrote LBA0 first and then the primary header and its entry
+ * array as separate writes; a quota refusal in the middle left the primary
+ * header describing an entry array that was never written (the parser then
+ * finds zero partitions) with a stale backup.  Writing the primary as one
+ * contiguous block means a refusal happens before anything lands, and the
+ * backup-first order means that while the primary is still old it remains
+ * complete.  If any step fails, the regions already written are restored to
+ * the bytes read at entry, so a failed partadd leaves the previous table. */
 static int part_save(CFS *c) {
     if (c->part_kind == CFS_PART_MBR) {
         uint8_t sec[MBR_SECTOR_SIZE];
-        mbr_build(sec, c->part_cache, c->part_n);
+        if (mbr_build(sec, c->part_cache, c->part_n) != 0) {
+            c->part_kind = -1;   /* the cache cannot be written; re-read it */
+            return -1;
+        }
         int rc = cfs_block_write(c, sec, sizeof(sec), 0);
-        if (rc) return rc;
-        c->part_kind = -1;   /* force re-parse */
-        return 0;
+        c->part_kind = -1;   /* force re-parse, whether or not the write landed */
+        return rc;
     }
     if (c->part_kind == CFS_PART_GPT) {
         uint64_t sz = cfs_block_size(c);
         uint64_t grow = 1ULL << 20;   /* 1MB: roomy minimum (≥ 34+33 sectors) */
         if (sz < grow) {
-            if (cfs_block_resize(c, grow) != 0) return -1;
+            if (cfs_block_resize(c, grow) != 0) { c->part_kind = -1; return -1; }
             sz = grow;
         }
         uint64_t sectors = sz / MBR_SECTOR_SIZE;
+        if (sectors < GPT_MIN_DISK_SECT) { c->part_kind = -1; return -1; }
 
-        uint8_t *lba0 = malloc(MBR_SECTOR_SIZE);
-        uint8_t *hdr = malloc(MBR_SECTOR_SIZE);
+        size_t back_len = GPT_ENTRIES_BYTES + MBR_SECTOR_SIZE;   /* entries + header */
+        uint8_t *lba0    = malloc(MBR_SECTOR_SIZE);
+        uint8_t *hdr     = malloc(MBR_SECTOR_SIZE);              /* primary header */
+        uint8_t *bhdr    = malloc(MBR_SECTOR_SIZE);              /* backup header */
         uint8_t *entries = malloc(GPT_ENTRIES_BYTES);
-        if (!lba0 || !hdr || !entries) { free(lba0); free(hdr); free(entries); return -1; }
+        uint8_t *prim    = malloc(GPT_TABLE_BYTES);              /* LBA1..LBA33 */
+        uint8_t *oldprim = malloc(GPT_TABLE_BYTES);
+        uint8_t *back    = malloc(back_len);
+        uint8_t *oldback = malloc(back_len);
+        if (!lba0 || !hdr || !bhdr || !entries || !prim || !oldprim || !back || !oldback) {
+            free(lba0); free(hdr); free(bhdr); free(entries);
+            free(prim); free(oldprim); free(back); free(oldback);
+            c->part_kind = -1;
+            return -1;
+        }
+
+        uint64_t backup_lba = sectors - 1;
+        uint64_t backup_off = backup_lba * MBR_SECTOR_SIZE - GPT_ENTRIES_BYTES;
 
         gpt_build(lba0, hdr, entries, c->part_cache, c->part_n, sectors);
-        int rc = 0;
-        uint64_t backup_lba = sectors - 1;
-        int w1 = cfs_block_write(c, lba0, MBR_SECTOR_SIZE, 0);
-        int w2 = cfs_block_write(c, hdr, MBR_SECTOR_SIZE, MBR_SECTOR_SIZE);
-        int w3 = cfs_block_write(c, entries, GPT_ENTRIES_BYTES, MBR_SECTOR_SIZE * GPT_ENTRIES_LBA);
-        int w4 = cfs_block_write(c, entries, GPT_ENTRIES_BYTES, backup_lba * MBR_SECTOR_SIZE - GPT_ENTRIES_BYTES);
-        if (w1 != 0 || w2 != 0 || w3 != 0 || w4 != 0)
-            rc = -1;
-        else {
-            /* backup header: cur_lba=backup, backup_lba=1, re-CRC */
-            GptHeader *bh = (GptHeader *)hdr;
-            le64w((uint8_t *)&bh->cur_lba, backup_lba);
-            le64w((uint8_t *)&bh->backup_lba, 1);
-            le32w((uint8_t *)&bh->hdr_crc, 0);
-            le32w((uint8_t *)&bh->hdr_crc, cfs_crc32(hdr, 92));
-            int w5 = cfs_block_write(c, hdr, MBR_SECTOR_SIZE, (off_t)(backup_lba * MBR_SECTOR_SIZE));
-            if (w5 != 0)
-                rc = -1;
+
+        /* Backup header: same table, located at the last LBA and pointing at
+         * the backup entry array (32 sectors before it). */
+        memcpy(bhdr, hdr, MBR_SECTOR_SIZE);
+        GptHeader *bh = (GptHeader *)bhdr;
+        le64w((uint8_t *)&bh->cur_lba, backup_lba);
+        le64w((uint8_t *)&bh->backup_lba, 1);
+        le64w((uint8_t *)&bh->entries_lba, backup_lba - GPT_ENTRIES_BYTES / MBR_SECTOR_SIZE);
+        le32w((uint8_t *)&bh->hdr_crc, 0);
+        le32w((uint8_t *)&bh->hdr_crc, cfs_crc32(bhdr, 92));
+
+        memcpy(prim, hdr, MBR_SECTOR_SIZE);
+        memcpy(prim + MBR_SECTOR_SIZE, entries, GPT_ENTRIES_BYTES);
+        memcpy(back, entries, GPT_ENTRIES_BYTES);
+        memcpy(back + GPT_ENTRIES_BYTES, bhdr, MBR_SECTOR_SIZE);
+
+        /* Snapshot the current table for rollback. */
+        if (cfs_block_read(c, oldprim, GPT_TABLE_BYTES, 0) != (ssize_t)GPT_TABLE_BYTES ||
+            cfs_block_read(c, oldback, back_len, (off_t)backup_off) != (ssize_t)back_len) {
+            free(lba0); free(hdr); free(bhdr); free(entries);
+            free(prim); free(oldprim); free(back); free(oldback);
+            c->part_kind = -1;
+            return -1;
         }
-        free(lba0); free(hdr); free(entries);
-        if (rc == 0) { c->part_kind = -1; return 0; }
+
+        int rc = 0, try_back = 1, try_prim = 0, try_mbr = 0;
+        if (cfs_block_write(c, back, back_len, (off_t)backup_off) != 0) rc = -1;
+        else {
+            try_prim = 1;
+            if (cfs_block_write(c, prim, GPT_TABLE_BYTES - MBR_SECTOR_SIZE,
+                                MBR_SECTOR_SIZE) != 0) rc = -1;
+            else {
+                try_mbr = 1;
+                if (cfs_block_write(c, lba0, MBR_SECTOR_SIZE, 0) != 0) rc = -1;
+            }
+        }
+        if (rc != 0) {
+            /* Restore newest-first, primary before the protective MBR: a
+             * reader that re-parses mid-rollback must still see LBA0 and the
+             * header agree.  Best effort — a failed attempt left the old
+             * bytes in place anyway (the quota check precedes the write). */
+            if (try_prim)
+                cfs_block_write(c, oldprim + MBR_SECTOR_SIZE,
+                                GPT_TABLE_BYTES - MBR_SECTOR_SIZE, MBR_SECTOR_SIZE);
+            if (try_back)
+                cfs_block_write(c, oldback, back_len, (off_t)backup_off);
+            if (try_mbr)
+                cfs_block_write(c, oldprim, MBR_SECTOR_SIZE, 0);
+        }
+        free(lba0); free(hdr); free(bhdr); free(entries);
+        free(prim); free(oldprim); free(back); free(oldback);
+        c->part_kind = -1;   /* re-parse: table may be old or new, never mixed */
         return rc;
     }
     return -1;
@@ -357,17 +454,24 @@ int cfs_part_get(CFS *c, int idx, CfsPartition *out) {
 ssize_t cfs_part_read(CFS *c, int idx, void *buf, size_t size, off_t offset) {
     CfsPartition p;
     if (!c || !buf || part_load(c) != 0 || cfs_part_get(c, idx, &p) != 0) return -1;
-    if (offset < 0 || (uint64_t)offset > p.size) return -1;
+    if (offset < 0) return -1;
+    /* EOF is a short read of zero bytes, not an error: pread(2) semantics,
+     * and the block layer cannot express a zero-length read (it returns -1). */
+    uint64_t off = (uint64_t)offset;
+    if (off >= p.size) return 0;
     size_t n = size;
-    if ((uint64_t)offset + n > p.size) n = (size_t)(p.size - (uint64_t)offset);
-    return cfs_block_read(c, buf, n, (off_t)(p.start + (uint64_t)offset));
+    if (n > p.size - off) n = (size_t)(p.size - off);   /* no offset+size overflow */
+    if (n == 0) return 0;
+    return cfs_block_read(c, buf, n, (off_t)(p.start + off));
 }
 
 int cfs_part_write(CFS *c, int idx, const void *buf, size_t size, off_t offset) {
     CfsPartition p;
     if (!c || !buf || part_load(c) != 0 || cfs_part_get(c, idx, &p) != 0) return -1;
-    if (offset < 0 || (uint64_t)offset + size > p.size) return -1;
-    return cfs_block_write(c, buf, size, (off_t)(p.start + (uint64_t)offset));
+    if (offset < 0) return -1;
+    uint64_t off = (uint64_t)offset;
+    if (off > p.size || size > p.size - off) return -1;   /* overflow-safe */
+    return cfs_block_write(c, buf, size, (off_t)(p.start + off));
 }
 
 int cfs_part_label(CFS *c, int kind) {
@@ -395,6 +499,14 @@ int cfs_part_label(CFS *c, int kind) {
     return part_save(c);
 }
 
+/* [a0, a0+asz) and [b0, b0+bsz) overlap?  Subtraction keeps the comparison
+ * inside 64 bits even when either range reaches the top of the address
+ * space; the naive `a0 + asz > b0` form wraps there. */
+static int ranges_overlap(uint64_t a0, uint64_t asz, uint64_t b0, uint64_t bsz) {
+    if (asz == 0 || bsz == 0) return 0;
+    return a0 <= b0 ? (b0 - a0 < asz) : (a0 - b0 < bsz);
+}
+
 int cfs_part_add(CFS *c, uint64_t start, uint64_t size,
                  uint8_t mbr_type, const char *guid, int bootable) {
     if (!c || !(c->flags & CFS_RDWR)) return -1;
@@ -404,15 +516,38 @@ int cfs_part_add(CFS *c, uint64_t start, uint64_t size,
     if (start % MBR_SECTOR_SIZE || size % MBR_SECTOR_SIZE) return -3;   /* 512B alignment */
     if (size == 0) return -3;
     uint64_t disk = cfs_block_size(c);
-    if (start + size > disk) return -4;             /* out of disk */
+    /* Written without start+size so a wrapped sum cannot look in-bounds. */
+    if (start >= disk || size > disk - start) return -4;   /* out of disk */
+
+    /* A partition must not cover the table that describes it: LBA0 for MBR,
+     * LBA0-33 and the backup copy in the last 33 sectors for GPT.  Writing
+     * to such a partition would erase the table (and, for GPT, its backup). */
+    if (c->part_kind == CFS_PART_MBR) {
+        if (start < (uint64_t)MBR_FIRST_USABLE * MBR_SECTOR_SIZE) return -8;
+        /* MBR stores both fields as 32-bit sector counts.  Refuse before
+         * mbr_build truncates: a truncated start parses back as LBA 0. */
+        uint64_t first_sect = start / MBR_SECTOR_SIZE;
+        uint64_t n_sect     = size / MBR_SECTOR_SIZE;
+        if (first_sect > 0xFFFFFFFFull || n_sect > 0xFFFFFFFFull ||
+            first_sect + n_sect - 1 > 0xFFFFFFFFull) return -9;
+    } else {
+        uint64_t disk_sect = disk / MBR_SECTOR_SIZE;
+        uint64_t first_sect = start / MBR_SECTOR_SIZE;
+        uint64_t n_sect = size / MBR_SECTOR_SIZE;
+        if (disk_sect < GPT_MIN_DISK_SECT) return -8;
+        uint64_t last_usable = disk_sect - GPT_LAST_USABLE_RESERVE;   /* inclusive */
+        if (first_sect < GPT_FIRST_USABLE ||
+            first_sect + n_sect - 1 > last_usable) return -8;
+    }
     if (c->part_kind == CFS_PART_MBR && c->part_n >= MBR_PART_ENTRIES) return -5;
     if (c->part_kind == CFS_PART_GPT && c->part_n >= GPT_ENTRIES_MAX) return -5;
 
     for (int i = 0; i < c->part_n; i++) {
-        uint64_t a0 = c->part_cache[i].start, a1 = a0 + c->part_cache[i].size;
-        if (start < a1 && a0 < start + size) return -6;   /* overlap */
+        if (ranges_overlap(start, size, c->part_cache[i].start,
+                           c->part_cache[i].size)) return -6;   /* overlap */
     }
-    if (start * MBR_SECTOR_SIZE % (1ULL << 20) != 0)
+    /* start is in bytes; the 1MiB alignment test is on the byte offset. */
+    if (start % (1ULL << 20) != 0)
         fprintf(stderr, "cfs: warning: partition start not 1MB-aligned (%llu)\n",
                 (unsigned long long)start);
 
@@ -439,15 +574,9 @@ int cfs_part_add(CFS *c, uint64_t start, uint64_t size,
             slot++;
         }
         p->index = slot;
-        const uint8_t *tg = NULL;
-        switch (mbr_type) {
-        case MBR_TYPE_EFI:  tg = GPT_GUID_EFI;   snprintf(p->type_str, sizeof(p->type_str), "efi"); break;
-        case MBR_TYPE_SWAP: tg = GPT_GUID_SWAP;  snprintf(p->type_str, sizeof(p->type_str), "swap"); break;
-        case MBR_TYPE_FAT16:
-        case MBR_TYPE_FAT32:
-        case MBR_TYPE_NTFS: tg = GPT_GUID_MS;    snprintf(p->type_str, sizeof(p->type_str), "ms-basic"); break;
-        default:            tg = GPT_GUID_LINUX; snprintf(p->type_str, sizeof(p->type_str), "linux"); break;
-        }
+        const char *tn = NULL;
+        const uint8_t *tg = gpt_guid_for_type(mbr_type, &tn);
+        snprintf(p->type_str, sizeof(p->type_str), "%s", tn);
         uint8_t gb[16];
         if (guid) {
             if (guid_from_str(guid, gb) != 0) return -7;
@@ -457,7 +586,7 @@ int cfs_part_add(CFS *c, uint64_t start, uint64_t size,
         guid_to_str(gb, p->guid);
     }
     c->part_n++;
-    if (part_save(c) != 0) { c->part_n--; return -1; }
+    if (part_save(c) != 0) { cfs_part_invalidate(c); return -1; }
     return p->index;
 }
 
@@ -483,7 +612,7 @@ int cfs_part_del(CFS *c, int idx) {
                 (size_t)(c->part_n - found - 1) * sizeof(CfsPartition));
         c->part_n--;
     }
-    if (part_save(c) != 0) { c->part_n++; return -1; }
+    if (part_save(c) != 0) { cfs_part_invalidate(c); return -1; }
     return 0;
 }
 
@@ -502,8 +631,18 @@ int cfs_part_type(CFS *c, int idx, uint8_t mbr_type, const char *guid, int boota
                 }
             } else {
                 uint8_t gb[16];
-                if (guid && guid_from_str(guid, gb) == 0)
+                if (guid) {
+                    if (guid_from_str(guid, gb) == 0)
+                        guid_to_str(gb, p->guid);
+                } else if (mbr_type != MBR_TYPE_EMPTY) {
+                    /* `parttype <cfs> <n> efi` on GPT: the CLI has only the
+                     * type name, so resolve it here instead of doing nothing. */
+                    const char *tn = NULL;
+                    const uint8_t *tg = gpt_guid_for_type(mbr_type, &tn);
+                    memcpy(gb, tg, 16);
                     guid_to_str(gb, p->guid);
+                    snprintf(p->type_str, sizeof(p->type_str), "%s", tn);
+                }
             }
             if (bootable >= 0) p->bootable = bootable ? 1 : 0;
             return part_save(c);

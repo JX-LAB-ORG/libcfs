@@ -48,7 +48,12 @@ int cfs_mkfs_ext4_at(CFS *c, uint64_t base_off, uint64_t size) {
      * hard limit (cfs_block_write refuses anything past it), so a formatter
      * that wrote first and resized at the end would have every write
      * refused — the CLI path only worked because cfs-tool resized for it. */
-    if (cfs_block_resize(c, base_off + size) != 0) return -1;
+    /* Grow to fit, but never pass a size below the current capacity: resize
+     * is grow-only (a smaller request is refused), and the caller may have
+     * declared a device slightly larger than this partition — the GPT tail
+     * reserves 34 sectors for the backup table. */
+    if (cfs_block_size(c) < base_off + size &&
+        cfs_block_resize(c, base_off + size) != 0) return -1;
     /* A block group holds at most 8 x block_size blocks (32768 with 4K
      * blocks).  Cramming a larger filesystem into one group is what made
      * e2fsck call the superblock corrupt, so past that we lay out real

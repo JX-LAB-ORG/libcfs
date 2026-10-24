@@ -44,6 +44,12 @@ struct CFS {
     uint8_t      *pend_buf;
     size_t        pend_n, pend_cap;
     uint64_t      pend_off;
+    /* Set while dedup_pend_flush() is inside store_append().  store_append()
+     * ends with cfs_sync(), which re-enters the flush; the nested call must
+     * not append the same buffer a second time.  The bytes stay in pend_* (
+     * they are cleared only once the append has landed), so without this the
+     * sync would recurse forever. */
+    int           pend_flushing;
 
     /* Physical quota: the most this container's file may occupy on the host,
      * in bytes (0 = unlimited).  The declared device size says how big the

@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "cfs.h"
+#include "cfs_part.h"            /* table geometry: 1MiB start, GPT last usable */
 #include "cfs_format.h"          /* CFS_VERSION: the on-disk container format */
 #include "../libcpool/cpenc.h"   /* CPENC_VERSION, for --version */
 #include <stdio.h>
@@ -34,7 +35,8 @@ static void usage(const char *prog) {    FILE *f = usage_fp ? usage_fp : stderr;
         "                                  Install ISO content into ext4\n"
         "                                  (mkfs + populate, standalone disk)\n"
         "                                  Format .cfs as ext4/fat32/exfat/swap\n"
-        "                                  -p <n>: format inside partition n\n"
+        "                                  -p <n>: create <n> partitions, format\n"
+        "                                          partition <n>\n"
         "                                  -g:     GPT partition table (with -p)\n"
         "  ls     <cfs>        [dir]        List contents\n"
         "  cat    <cfs>        <path>       Print file to stdout\n"
@@ -105,6 +107,42 @@ static void fmt_size(char *buf, size_t n, uint64_t v) {
     else if (v >= (1ULL << 20)) snprintf(buf, n, "%.1fM", v / 1048576.0);
     else if (v >= 1024) snprintf(buf, n, "%.1fK", v / 1024.0);
     else snprintf(buf, n, "%llu", (unsigned long long)v);
+}
+
+/* Build a fresh table with `n` equal-sized partitions and return partition
+ * `n` in *sel.  mkfs/install -p used to take the number and ignore it: the
+ * table always got one partition from 1MiB to the end, and with -g that
+ * partition covered the backup GPT.  Partition 1 keeps the old geometry
+ * exactly; partition n only exists if n partitions were asked for. */
+static int create_partitions(CFS *c, int kind, int n, uint64_t disk_sz, CfsPartition *sel) {
+    if (n < 1) return -1;
+    if (cfs_part_label(c, kind) != 0) return -1;
+
+    uint64_t sectors = disk_sz / MBR_SECTOR_SIZE;
+    uint64_t first = MBR_FIRST_USABLE;                 /* LBA 2048 = 1MiB */
+    uint64_t last;                                     /* inclusive */
+    if (sectors <= first) return -1;
+    if (kind == CFS_PART_GPT) {
+        /* Stop before the backup entries/header at the tail. */
+        if (sectors <= GPT_FIRST_USABLE + GPT_LAST_USABLE_RESERVE) return -1;
+        last = sectors - GPT_LAST_USABLE_RESERVE;
+    } else {
+        last = sectors - 1;
+    }
+    if (last < first) return -1;
+
+    uint64_t total = last - first + 1;                 /* sectors */
+    if (total < (uint64_t)n) return -1;
+    uint64_t slice = total / (uint64_t)n;
+
+    for (int i = 0; i < n; i++) {
+        uint64_t s = first + (uint64_t)i * slice;
+        uint64_t cnt = (i == n - 1) ? (last - s + 1) : slice;
+        int rc = cfs_part_add(c, s * MBR_SECTOR_SIZE, cnt * MBR_SECTOR_SIZE,
+                              MBR_TYPE_LINUX, NULL, 0);
+        if (rc < 0) return rc;
+    }
+    return cfs_part_get(c, n, sel);
 }
 
 static void delete_all_parts(CFS *c) {
@@ -445,18 +483,22 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "Usage: %s mkfs <fstype> <size> <out.cfs> [-p <n>] [-g]\n", argv[0]);
             fprintf(stderr, "  fstype: ext4 | fat32 | exfat | swap\n");
             fprintf(stderr, "  size:   100M, 1G, 10G, etc.\n");
-            fprintf(stderr, "  -p <n>: format inside partition n (creates MBR + partition 1)\n");
+            fprintf(stderr, "  -p <n>: create <n> partitions, format partition <n>\n");
             fprintf(stderr, "  -g:     use GPT instead of MBR (with -p)\n");
             return 1;
         }
         const char *fstype = argv[2], *size_str = argv[3], *out = argv[4];
-        int part = 0, gpt = 0, raw = 0;
+        int part = 0, part_req = 0, gpt = 0, raw = 0;
         const char *disk_kind = NULL;
         for (int i = 5; i < argc; i++) {
-            if (!strcmp(argv[i], "-p") && i + 1 < argc) part = atoi(argv[++i]);
+            if (!strcmp(argv[i], "-p") && i + 1 < argc) { part = atoi(argv[++i]); part_req = 1; }
             else if (!strcmp(argv[i], "-g")) gpt = 1;
             else if (!strcmp(argv[i], "--raw")) raw = 1;
             else if (!strcmp(argv[i], "--disk") && i + 1 < argc) disk_kind = argv[++i];
+        }
+        if (part_req && part < 1) {
+            fprintf(stderr, "mkfs: -p needs a partition number >= 1\n");
+            return 1;
         }
 
         int is_ext4 = !strcmp(fstype, "ext4");
@@ -476,7 +518,7 @@ int main(int argc, char *argv[]) {
             else if (*end == 0) disk_sz = (uint64_t)v;
         }
         if (disk_sz < 262144) { fprintf(stderr, "mkfs: size too small (min 256KB)\n"); return 1; }
-        if (part && disk_sz < 2ULL * 1024 * 1024) {
+        if (part_req && disk_sz < 2ULL * 1024 * 1024) {
             fprintf(stderr, "mkfs: -p requires at least 2MB (1MB partition start)\n");
             return 1;
         }
@@ -500,19 +542,13 @@ int main(int argc, char *argv[]) {
 
         int rc;
         cfs_block_resize(c, disk_sz);
-        if (part) {
+        if (part_req) {
             int kind = gpt ? CFS_PART_GPT : CFS_PART_MBR;
-            if (cfs_part_label(c, kind) != 0) {
-                fprintf(stderr, "mkfs: partition label failed\n"); cfs_close(c); unlink(out); return 1;
-            }
-            uint64_t pstart = 1ULL << 20;   /* LBA 2048 */
-            int ar = cfs_part_add(c, pstart, disk_sz - pstart, 0x83, NULL, 0);
-            if (ar < 0) {
-                fprintf(stderr, "mkfs: partadd failed (%d)\n", ar); cfs_close(c); unlink(out); return 1;
-            }
             CfsPartition p;
-            if (cfs_part_get(c, 1, &p) != 0) {
-                fprintf(stderr, "mkfs: partition lookup failed\n"); cfs_close(c); unlink(out); return 1;
+            int ar = create_partitions(c, kind, part, disk_sz, &p);
+            if (ar != 0) {
+                fprintf(stderr, "mkfs: partition setup failed (%d)\n", ar);
+                cfs_close(c); unlink(out); return 1;
             }
             if (is_ext4) rc = cfs_mkfs_ext4_at(c, p.start, p.size);
             else if (is_fat32) rc = cfs_mkfs_fat32_at(c, p.start, p.size);
@@ -535,7 +571,7 @@ int main(int argc, char *argv[]) {
             printf("     mount with: cfs_block_hook.so + mount -t %s /dev/vda /mnt\n",
                    is_ext4 ? "ext4" : (is_fat32 ? "vfat" : (is_exfat ? "exfat" : "swap")));
         else
-            printf("     partition table: %s, fs on partition 1\n", gpt ? "gpt" : "mbr");
+            printf("     partition table: %s, fs on partition %d\n", gpt ? "gpt" : "mbr", part);
         return 0;
     }
 
@@ -547,16 +583,20 @@ int main(int argc, char *argv[]) {
         if (argc < 5) {
             fprintf(stderr, "Usage: %s install <iso> <size> <out.cfs> [-p <n>] [-g]\n", argv[0]);
             fprintf(stderr, "  size:  100M, 1G, etc. (disk size; ISO must fit)\n");
-            fprintf(stderr, "  -p <n>: install into partition n (creates MBR + partition 1 if missing)\n");
+            fprintf(stderr, "  -p <n>: create <n> partitions, install into partition <n>\n");
             fprintf(stderr, "  -g:     use GPT instead of MBR (with -p)\n");
             return 1;
         }
         const char *iso_path = argv[2], *size_str = argv[3], *out = argv[4];
-        int part = 0, gpt = 0, raw = 0;
+        int part = 0, part_req = 0, gpt = 0, raw = 0;
         for (int i = 5; i < argc; i++) {
-            if (!strcmp(argv[i], "-p") && i + 1 < argc) part = atoi(argv[++i]);
+            if (!strcmp(argv[i], "-p") && i + 1 < argc) { part = atoi(argv[++i]); part_req = 1; }
             else if (!strcmp(argv[i], "-g")) gpt = 1;
             else if (!strcmp(argv[i], "--raw")) raw = 1;
+        }
+        if (part_req && part < 1) {
+            fprintf(stderr, "install: -p needs a partition number >= 1\n");
+            return 1;
         }
 
         uint64_t disk_sz = 0;
@@ -588,19 +628,13 @@ int main(int argc, char *argv[]) {
 
         int rc;
         uint64_t base = 0, fsize = disk_sz;
-        if (part) {
+        if (part_req) {
             int kind = gpt ? CFS_PART_GPT : CFS_PART_MBR;
-            if (cfs_part_label(c, kind) != 0) {
-                fprintf(stderr, "install: partition label failed\n"); cfs_close(c); unlink(out); free(iso); return 1;
-            }
-            uint64_t pstart = 1ULL << 20;   /* LBA 2048 */
-            int ar = cfs_part_add(c, pstart, disk_sz - pstart, 0x83, NULL, 0);
-            if (ar < 0) {
-                fprintf(stderr, "install: partadd failed (%d)\n", ar); cfs_close(c); unlink(out); free(iso); return 1;
-            }
             CfsPartition p;
-            if (cfs_part_get(c, 1, &p) != 0) {
-                fprintf(stderr, "install: partition lookup failed\n"); cfs_close(c); unlink(out); free(iso); return 1;
+            int ar = create_partitions(c, kind, part, disk_sz, &p);
+            if (ar != 0) {
+                fprintf(stderr, "install: partition setup failed (%d)\n", ar);
+                cfs_close(c); unlink(out); free(iso); return 1;
             }
             base = p.start; fsize = p.size;
         }
@@ -615,8 +649,10 @@ int main(int argc, char *argv[]) {
         free(iso);
         if (rc != 0) { fprintf(stderr, "install: failed (%d)\n", rc); unlink(out); return 1; }
 
+        char where[40] = "";
+        if (part_req) snprintf(where, sizeof(where), ", partition %d", part);
         printf("cfs: ISO %s installed on %s (%llu MB disk%s)\n", iso_path, out,
-               (unsigned long long)(disk_sz >> 20), part ? ", partition 1" : "");
+               (unsigned long long)(disk_sz >> 20), where);
         return 0;
     }
 
@@ -679,7 +715,9 @@ int main(int argc, char *argv[]) {
                               rc == -4 ? "out of disk" :
                               rc == -5 ? "no free entries" :
                               rc == -6 ? "overlaps existing partition" :
-                              rc == -7 ? "bad GUID" : "failed";
+                              rc == -7 ? "bad GUID" :
+                              rc == -8 ? "covers the partition table" :
+                              rc == -9 ? "outside the MBR 32-bit sector range" : "failed";
             fprintf(stderr, "partadd: %s\n", msg);
             return 1;
         }

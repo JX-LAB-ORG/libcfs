@@ -90,7 +90,12 @@ cfs-fuse: cfs-fuse.c cfs.o cfs_part.o cfs_dedup.o ../libcpool/cpenc.o ../libcpoo
 	cc $(CFLAGS) $(shell pkg-config --cflags fuse3) cfs-fuse.c cfs.o cfs_part.o cfs_dedup.o ../libcpool/cpenc.o ../libcpool/bwt.o $(shell pkg-config --libs fuse3) -lm -o cfs-fuse
 endif
 
-test: $(OBJS) $(CPENC) test/iso_mk.o test/ext2_read.o
+# Partition-layer regressions.  The block-hook case re-executes the test under
+# LD_PRELOAD and the mkfs/install cases drive cfs-tool, so both are built first.
+test/cfs_part_fix_test: test/cfs_part_fix_test.c cfs.o cfs_part.o cfs_dedup.o test/iso_mk.o ../libcpool/cpenc.o ../libcpool/bwt.o cfs-tool cfs_block_hook.so
+	cc $(CFLAGS) test/cfs_part_fix_test.c cfs.o cfs_part.o cfs_dedup.o test/iso_mk.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o test/cfs_part_fix_test
+
+test: $(OBJS) $(CPENC) test/iso_mk.o test/ext2_read.o test/cfs_part_fix_test
 	cc $(CFLAGS) test/cfs_test.c cfs.o cfs_dedup.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o test/cfs_test
 	./test/cfs_test
 	@echo "=== cfs_rw_test ==="
@@ -111,6 +116,8 @@ test: $(OBJS) $(CPENC) test/iso_mk.o test/ext2_read.o
 	@echo "=== cfs_part_test ==="
 	cc $(CFLAGS) test/cfs_part_test.c cfs.o cfs_part.o cfs_dedup.o cfs_mkfs_ext4.c cfs_mkfs_fat32.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o test/cfs_part_test
 	./test/cfs_part_test
+	@echo "=== cfs_part_fix_test ==="
+	./test/cfs_part_fix_test
 	@echo "=== cfs_install_test ==="
 	cc $(CFLAGS) test/cfs_install_test.c cfs.o cfs_part.o cfs_dedup.o cfs_mkfs_ext4.o cfs_ext4_install.o cfs_iso9660.o test/iso_mk.o test/ext2_read.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o test/cfs_install_test
 	./test/cfs_install_test
@@ -132,6 +139,9 @@ test: $(OBJS) $(CPENC) test/iso_mk.o test/ext2_read.o
 	@echo "=== cfs_regress_test ==="
 	cc $(CFLAGS) test/cfs_regress_test.c cfs.o cfs_dedup.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o test/cfs_regress_test
 	./test/cfs_regress_test
+	@echo "=== cfs_fixA_test ==="
+	cc $(CFLAGS) test/cfs_fixA_test.c cfs.o cfs_dedup.o cfs_verify.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o test/cfs_fixA_test
+	./test/cfs_fixA_test
 ifeq ($(HAS_OPENSSL),yes)
 	@echo "=== cfs_seal_test ==="
 	cc $(CFLAGS) test/cfs_seal_test.c cfs_seal.c -lcrypto -o test/cfs_seal_test
@@ -204,7 +214,7 @@ fuzz:
 clean:
 	rm -f $(OBJS) cfs_seal.o cfs_preload.o cfs_preload.so cfs-tool cfs_block_hook.so cfs-fuse
 	rm -f test/iso_mk.o test/ext2_read.o test/vblk_probe test/iso_gen
-	rm -f test/cfs_regress_test test/cfs_test test/cfs_rw_test test/cfs_dir_test test/cfs_new_test test/cfs_compact_test test/cfs_block_test test/cfs_part_test test/cfs_stress_test test/vblk_probe
+	rm -f test/cfs_regress_test test/cfs_fixA_test test/cfs_part_fix_test test/cfs_test test/cfs_rw_test test/cfs_dir_test test/cfs_new_test test/cfs_compact_test test/cfs_block_test test/cfs_part_test test/cfs_stress_test test/vblk_probe
 	rm -f test/cfs_dedup_test test/cfs_dedup_write_test test/cfs_dedup_writepath_test test/cfs_dedup_codec_test
 	rm -f test/cfs_seal_test
 	rm -f test/bench_cfs test/fuzz_cfs

@@ -99,7 +99,12 @@ int cfs_mkfs_exfat_at(CFS *c, uint64_t base_off, uint64_t size) {
     if (!c || base_off % EXFAT_SECTOR) return -1;
     /* Capacity first: cfs_block_write refuses anything past the declared
      * size, so the formatter must declare it before it writes. */
-    if (cfs_block_resize(c, base_off + size) != 0) return -1;
+    /* Grow to fit, but never pass a size below the current capacity: resize
+     * is grow-only (a smaller request is refused), and the caller may have
+     * declared a device slightly larger than this partition — the GPT tail
+     * reserves 34 sectors for the backup table. */
+    if (cfs_block_size(c) < base_off + size &&
+        cfs_block_resize(c, base_off + size) != 0) return -1;
 
     uint64_t total_sects = size / EXFAT_SECTOR;
 
