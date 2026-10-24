@@ -24,8 +24,11 @@ the container's blocks are CPEnc streams and the codec objects are shared.
 Check what you have:
 
 ```sh
-./cfs-tool --version      # cfs-tool 0.1.0 (container format 2, block codec 7)
+./cfs-tool --version      # cfs-tool 0.1.0 (container format 3, block codec 7)
 ```
+
+Container format 3 adds a second superblock slot (crash consistency); format 2
+containers still open and are upgraded in place on their first write.
 
 ---
 

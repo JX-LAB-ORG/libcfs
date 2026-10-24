@@ -142,6 +142,9 @@ test: $(OBJS) $(CPENC) test/iso_mk.o test/ext2_read.o test/cfs_part_fix_test
 	@echo "=== cfs_fixA_test ==="
 	cc $(CFLAGS) test/cfs_fixA_test.c cfs.o cfs_dedup.o cfs_verify.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o test/cfs_fixA_test
 	./test/cfs_fixA_test
+	@echo "=== cfs_crash_test ==="
+	cc $(CFLAGS) test/cfs_crash_test.c cfs.o cfs_dedup.o cfs_verify.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o test/cfs_crash_test
+	./test/cfs_crash_test
 ifeq ($(HAS_OPENSSL),yes)
 	@echo "=== cfs_seal_test ==="
 	cc $(CFLAGS) test/cfs_seal_test.c cfs_seal.c -lcrypto -o test/cfs_seal_test
@@ -205,7 +208,7 @@ testall: test cfs-tool cfs_preload.so cfs_block_hook.so
 	cc $(CFLAGS) test/vblk_probe.c -o test/vblk_probe
 	chmod +x test/cfs_block_hook_test.sh
 	./test/cfs_block_hook_test.sh
-	@echo "Tests: $(shell make test 2>&1 | grep '=== 0 failures ===' | wc -l)/11 passed"
+	@echo "Tests: $(shell make test 2>&1 | grep '=== 0 failures ===' | wc -l) suites passed"
 
 # Fuzz the container parser: libFuzzer + UBSan + guard pages (needs compiler-rt).
 fuzz:
@@ -214,7 +217,7 @@ fuzz:
 clean:
 	rm -f $(OBJS) cfs_seal.o cfs_preload.o cfs_preload.so cfs-tool cfs_block_hook.so cfs-fuse
 	rm -f test/iso_mk.o test/ext2_read.o test/vblk_probe test/iso_gen
-	rm -f test/cfs_regress_test test/cfs_fixA_test test/cfs_part_fix_test test/cfs_test test/cfs_rw_test test/cfs_dir_test test/cfs_new_test test/cfs_compact_test test/cfs_block_test test/cfs_part_test test/cfs_stress_test test/vblk_probe
+	rm -f test/cfs_regress_test test/cfs_fixA_test test/cfs_crash_test test/cfs_part_fix_test test/cfs_test test/cfs_rw_test test/cfs_dir_test test/cfs_new_test test/cfs_compact_test test/cfs_block_test test/cfs_part_test test/cfs_stress_test test/vblk_probe
 	rm -f test/cfs_dedup_test test/cfs_dedup_write_test test/cfs_dedup_writepath_test test/cfs_dedup_codec_test
 	rm -f test/cfs_seal_test
 	rm -f test/bench_cfs test/fuzz_cfs

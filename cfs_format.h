@@ -2,22 +2,38 @@
 #define CFS_FORMAT_H
 #include <stdint.h>
 #include <stddef.h>
+#include <string.h>
 
 /*
  * ── .cfs container layout ───────────────────────────────────
  *
- *  [SuperBlock    32B]   offset 0
+ *  v3 (crash-consistent, written by this code):
+ *  [Slot 0        44B]   offset 0    (inside a 512-byte sector)
+ *  [Slot 1        44B]   offset 512  (the other 512-byte sector)
+ *  [DataBlocks    M B]   offset >= CFS_SB_REGION (1024)
+ *  [InodeTable    N B]   wherever the slot that describes it says
+ *
+ *  v2 (legacy, still readable and upgraded on the first write):
+ *  [SuperBlock    40B]   offset 0
  *  [InodeTable    N B]   at inode_offset
- *  [DataBlocks    M B]   at inode_offset + inode_size
+ *  [DataBlocks    M B]   appended at inode_offset + inode_size
  *
  * Each Inode records one file/dir/symlink entry.
  * Each DataBlock is a CPEnc-compressed slab.
+ *
+ * The two slots hold the same fields; each also carries a sequence number
+ * and a CRC32 over its own 40-byte prefix.  A commit writes the new data,
+ * then the new table, then the slot that is NOT the live one, so one slot
+ * always points at a complete table.  The live table is never overwritten:
+ * its region is the one the newest valid slot points at.
  */
 
-/* ── SuperBlock (32 bytes) ─────────────────────────────────── */
+/* ── SuperBlock (40-byte fields, 44-byte v3 slot record) ────── */
 #define CFS_MAGIC       "LIBCFS02"
 #define CFS_MAGIC_LEN   8
-#define CFS_VERSION     2
+#define CFS_VERSION        3   /* written by this code */
+#define CFS_VERSION_LEGACY 2   /* still readable; upgraded on first write */
+#define CFS_VERSION_MIN    CFS_VERSION_LEGACY
 #define CFS_BLOCK_SPLIT  (64ULL * 1024 * 1024)  /* split files at 64MB per block */
 
 /* Hard ceiling on one block's decompressed size, matching the codec's own
@@ -28,7 +44,7 @@
 
 typedef struct {
     char     magic[8];       /* "LIBCFS02" */
-    uint16_t version;        /* 2 */
+    uint16_t version;        /* 3 (2 = legacy, read-only compatible) */
     uint64_t inode_offset;   /* where InodeTable starts */
     uint32_t inode_size;     /* total byte size of InodeTable */
     uint32_t file_count;     /* number of entries */
@@ -36,14 +52,112 @@ typedef struct {
     uint16_t flags;          /* container attributes (RAW = uncompressed) */
 } CfsSuperBlock;
 /* The struct above is the in-memory form, which the compiler pads (48 bytes,
- * flags at 40).  The on-disk form is written field by field at the offsets
- * cfs.c uses: magic 0, version 8, inode_offset 10, inode_size 18,
- * file_count 22, created_at 26, flags 34 — 36 bytes, padded to 40. */
-#define CFS_SB_SIZE  40   /* on-disk size; see the note above */
+ * flags at 40).  The on-disk fields are written at fixed offsets:
+ * magic 0, version 8, inode_offset 10, inode_size 18, file_count 22,
+ * created_at 26, flags 34 — 36 bytes, padded to 40.  A v3 slot record adds
+ * seq (u32) at 36 and a CRC32 of bytes [0,40) at 40, for 44 bytes.  Both
+ * fit inside one 512-byte sector, so a torn sector cannot touch the other
+ * slot. */
+#define CFS_SB_SIZE       40   /* legacy record / v3 CRC-covered prefix */
+#define CFS_SB_REC_SIZE   44   /* v3 slot record: 40 fields + seq + crc */
+#define CFS_SB_SEQ_OFF    36
+#define CFS_SB_CRC_OFF    40
+#define CFS_SB_SLOT_SIZE  512  /* one sector per slot: tear isolation */
+#define CFS_SB_SLOTS      2
+#define CFS_SB_REGION     (CFS_SB_SLOT_SIZE * CFS_SB_SLOTS)  /* 1024 */
 #define CFS_SB_FLAG_RAW 0x0001   /* whole container stored uncompressed */
 #define CFS_SB_FLAG_REMOVABLE  0x0002  /* media behaves like USB/SD */
 #define CFS_SB_FLAG_ROTATIONAL 0x0004  /* spinning disk (0 = SSD/flash) */
 #define CFS_SB_FLAG_SD         0x0008  /* removable media is an SD card */
+
+/* ── Slot record encode/decode (shared by cfs.c and cfs_verify.c) ──
+ * A slot is only trusted when its CRC matches; the CRC is what turns a torn
+ * 512-byte sector write into a fallback to the other slot instead of an
+ * unopenable container.  Version 2 has no CRC and is accepted only in slot 0
+ * (an old container's bytes at 512 are its data, not a slot). */
+static inline uint32_t cfs_sb_crc32(const void *data, size_t n) {
+    const uint8_t *p = (const uint8_t *)data;
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < n; i++) {
+        crc ^= p[i];
+        for (int k = 0; k < 8; k++)
+            crc = (crc >> 1) ^ (0xEDB88320u & (uint32_t)-(int32_t)(crc & 1u));
+    }
+    return ~crc;
+}
+static inline uint16_t cfs_rd16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
+static inline uint32_t cfs_rd32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+static inline uint64_t cfs_rd64(const uint8_t *p) {
+    return (uint64_t)cfs_rd32(p) | ((uint64_t)cfs_rd32(p + 4) << 32);
+}
+static inline void cfs_wr16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
+static inline void cfs_wr32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+}
+static inline void cfs_wr64(uint8_t *p, uint64_t v) {
+    cfs_wr32(p, (uint32_t)v); cfs_wr32(p + 4, (uint32_t)(v >> 32));
+}
+
+#define CFS_SB_SLOT_INVALID 0   /* no usable record */
+#define CFS_SB_SLOT_LEGACY  1   /* v2 record: no seq, no CRC */
+#define CFS_SB_SLOT_VALID   2   /* v3 record with a matching CRC */
+
+typedef struct {
+    int          kind;   /* CFS_SB_SLOT_* */
+    uint32_t     seq;    /* 0 for a legacy record */
+    CfsSuperBlock sb;
+} CfsSbSlot;
+
+static inline void cfs_sb_encode(uint8_t rec[CFS_SB_REC_SIZE],
+                                 const CfsSuperBlock *sb, uint32_t seq) {
+    for (unsigned i = 0; i < CFS_SB_REC_SIZE; i++) rec[i] = 0;
+    for (unsigned i = 0; i < 8; i++) rec[i] = (uint8_t)sb->magic[i];
+    cfs_wr16(rec + 8,  sb->version);
+    cfs_wr64(rec + 10, sb->inode_offset);
+    cfs_wr32(rec + 18, sb->inode_size);
+    cfs_wr32(rec + 22, sb->file_count);
+    cfs_wr64(rec + 26, sb->created_at);
+    cfs_wr16(rec + 34, sb->flags);
+    cfs_wr32(rec + CFS_SB_SEQ_OFF, seq);
+    cfs_wr32(rec + CFS_SB_CRC_OFF, cfs_sb_crc32(rec, CFS_SB_SIZE));
+}
+
+/* Returns CFS_SB_SLOT_*; @n is how many bytes could actually be read. */
+static inline int cfs_sb_decode(const uint8_t *rec, size_t n, CfsSbSlot *out) {
+    out->kind = CFS_SB_SLOT_INVALID;
+    out->seq = 0;
+    if (n < CFS_SB_SIZE) return out->kind;
+    if (memcmp(rec, CFS_MAGIC, CFS_MAGIC_LEN) != 0) return out->kind;
+    uint16_t ver = cfs_rd16(rec + 8);
+    out->sb.version      = ver;
+    out->sb.inode_offset = cfs_rd64(rec + 10);
+    out->sb.inode_size   = cfs_rd32(rec + 18);
+    out->sb.file_count   = cfs_rd32(rec + 22);
+    out->sb.created_at   = cfs_rd64(rec + 26);
+    out->sb.flags        = cfs_rd16(rec + 34);
+    for (unsigned i = 0; i < 8; i++) out->sb.magic[i] = (char)rec[i];
+    if (ver == CFS_VERSION) {
+        /* A v3 record without a matching CRC is a torn write, not a slot. */
+        if (n < CFS_SB_REC_SIZE) return out->kind;
+        uint32_t seq = cfs_rd32(rec + CFS_SB_SEQ_OFF);
+        if (seq == 0) return out->kind;
+        if (cfs_rd32(rec + CFS_SB_CRC_OFF) != cfs_sb_crc32(rec, CFS_SB_SIZE))
+            return out->kind;
+        out->kind = CFS_SB_SLOT_VALID;
+        out->seq = seq;
+        return out->kind;
+    }
+    if (ver == CFS_VERSION_LEGACY) {
+        out->kind = CFS_SB_SLOT_LEGACY;
+        out->seq = 0;
+        return out->kind;
+    }
+    return out->kind;
+}
 
 /* ── Inode (24-byte fixed part + 16 B per block + variable path) ─ */
 #define CFS_MODE_FILE   0

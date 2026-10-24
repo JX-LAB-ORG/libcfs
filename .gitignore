@@ -30,3 +30,4 @@ test/cfs_seal_test
 test/cfs_regress_test
 test/cfs_fixA_test
 test/cfs_part_fix_test
+test/cfs_crash_test

@@ -21,6 +21,26 @@ struct CFS {
     InodeEntry   *inodes;
     uint32_t      inode_count;
 
+    /* ── Crash-consistency state ──────────────────────────────────
+     * Two superblock slots, each in its own 512-byte sector: slot 0 at 0,
+     * slot 1 at CFS_SB_SLOT_SIZE.  sb_slot is the slot written last (the
+     * live one), sb_seq its sequence.  slot_off/slot_size describe the table
+     * each valid slot points at, so a commit knows which region is live and
+     * which is the older copy it may overwrite.
+     *
+     * append_off is the next byte a data block may occupy.  It is always at
+     * or past the end of both slots' tables, so an append can overwrite
+     * neither the live table nor the other slot's table (which a crash
+     * fallback needs).  c->sb.inode_offset is the *live* table, not a
+     * cursor: it moves only after a new table and its slot have landed. */
+    uint32_t      sb_seq;
+    int           sb_slot;
+    int           slot_valid[CFS_SB_SLOTS];
+    uint64_t      slot_off[CFS_SB_SLOTS];
+    uint32_t      slot_size[CFS_SB_SLOTS];
+    uint64_t      append_off;
+    int           legacy;     /* opened from a v2 record: upgrade on first sync */
+
     /* Partition-table cache (parsed from @block bytes on demand) */
     int      part_kind;          /* -1 unparsed, CFS_PART_NONE/MBR/GPT */
     int      part_n;

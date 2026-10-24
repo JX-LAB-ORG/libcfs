@@ -710,7 +710,11 @@ int cfs_verify(const char *path, unsigned flags, FILE *out) {
     off_t end = lseek(v.fd, 0, SEEK_END);
     v.fsz = end > 0 ? (uint64_t)end : 0;
 
-    /* ── 1. superblock ──────────────────────────────────────── */
+    /* ── 1. superblock slots ──────────────────────────────────
+     * Two slots, each in its own sector.  The newest valid one wins; a v2
+     * record (legacy layout, no CRC/seq) is only a superblock in slot 0.
+     * Checking the CRC here is the point: verify has to say that a torn
+     * slot exists even though the reader is able to fall back to the other. */
     VSb sb; memset(&sb, 0, sizeof sb);
     int have_sb = 0, fatal = 0;
     if (v.fsz < CFS_SB_SIZE) {
@@ -718,24 +722,74 @@ int cfs_verify(const char *path, unsigned flags, FILE *out) {
               (unsigned long long)v.fsz, (unsigned)CFS_SB_SIZE);
         fatal = 1;
     } else {
-        uint8_t b[CFS_SB_SIZE];
-        if (vpread(&v, b, sizeof b, 0) != 0) { vprob(&v, C_SB, 1, "cannot read the superblock"); fatal = 1; }
-        else {
-            memcpy(sb.magic, b, 8);
-            sb.version = rd16(b + 8);
-            sb.inode_off = rd64(b + 10);
-            sb.inode_size = rd32(b + 18);
-            sb.file_count = rd32(b + 22);
-            sb.created_at = rd64(b + 26);
-            sb.flags = rd16(b + 34);
+        static const uint64_t slot_off[2] = { 0, CFS_SB_SLOT_SIZE };
+        uint8_t raw[2][CFS_SB_REC_SIZE];
+        size_t  raw_n[2];
+        CfsSbSlot slot[2];
+        for (int i = 0; i < 2; i++) {
+            /* Partial read: an old container may end before the second slot. */
+            memset(raw[i], 0, sizeof raw[i]);
+            raw_n[i] = 0;
+            if (slot_off[i] < v.fsz) {
+                size_t avail = (size_t)(v.fsz - slot_off[i]);
+                if (avail > sizeof raw[i]) avail = sizeof raw[i];
+                ssize_t r = pread(v.fd, raw[i], avail, (off_t)slot_off[i]);
+                raw_n[i] = r > 0 ? (size_t)r : 0;
+            }
+            cfs_sb_decode(raw[i], raw_n[i], &slot[i]);
+        }
+        /* In an old container the bytes at 512 are data, not a record. */
+        if (slot[1].kind == CFS_SB_SLOT_LEGACY) slot[1].kind = CFS_SB_SLOT_INVALID;
+
+        int pick = -1;
+        if (slot[0].kind && slot[1].kind)
+            pick = slot[1].seq > slot[0].seq ? 1 : 0;
+        else if (slot[0].kind) pick = 0;
+        else if (slot[1].kind) pick = 1;
+
+        /* A record that has the magic and a known version but no matching
+         * CRC is a torn write — say so, even though @pick saves the day. */
+        for (int i = 0; i < 2; i++) {
+            if (slot[i].kind != CFS_SB_SLOT_INVALID) continue;
+            if (raw_n[i] < CFS_SB_SIZE ||
+                memcmp(raw[i], CFS_MAGIC, CFS_MAGIC_LEN)) continue;
+            uint16_t ver = cfs_rd16(raw[i] + 8);
+            if (ver != CFS_VERSION && ver != CFS_VERSION_LEGACY) continue;
+            vprob(&v, C_SB, 1, "slot %d: CRC does not match its fields "
+                  "(torn or corrupt; the reader would %s)",
+                  i, pick >= 0 ? "fall back to the other slot" : "refuse the container");
+        }
+        if (pick < 0) {
+            vprob(&v, C_SB, 1, "no valid superblock slot in either sector");
+            fatal = 1;
+        } else {
+            CfsSbSlot *w = &slot[pick];
+            memcpy(sb.magic, w->sb.magic, 8);
+            sb.version      = w->sb.version;
+            sb.inode_off    = w->sb.inode_offset;
+            sb.inode_size   = w->sb.inode_size;
+            sb.file_count   = w->sb.file_count;
+            sb.created_at   = w->sb.created_at;
+            sb.flags        = w->sb.flags;
             have_sb = 1;
+            if (w->kind == CFS_SB_SLOT_LEGACY) {
+                /* Informational, not a problem: this is the v2 layout the
+                 * reader upgrades on its first write. */
+                vprob(&v, C_SB, 0, "v2 (legacy) superblock in slot 0; layout "
+                      "is upgraded on the first write");
+            } else if (slot[pick ^ 1].kind == CFS_SB_SLOT_INVALID) {
+                vprob(&v, C_SB, 0, "using slot %d (seq %u); the other slot is "
+                      "not valid yet", pick, (unsigned)w->seq);
+            }
             if (memcmp(sb.magic, CFS_MAGIC, CFS_MAGIC_LEN)) {
                 vprob(&v, C_SB, 1, "bad magic %02x%02x%02x%02x... (expected \"%s\")",
                       sb.magic[0], sb.magic[1], sb.magic[2], sb.magic[3], CFS_MAGIC);
                 fatal = 1;   /* every offset below is derived from it */
             }
-            if (sb.version != CFS_VERSION)
-                vprob(&v, C_SB, 1, "version %u, this build reads %u", (unsigned)sb.version, (unsigned)CFS_VERSION);
+            if (sb.version != CFS_VERSION && sb.version != CFS_VERSION_LEGACY)
+                vprob(&v, C_SB, 1, "version %u, this build reads %u and %u",
+                      (unsigned)sb.version, (unsigned)CFS_VERSION_LEGACY,
+                      (unsigned)CFS_VERSION);
             if (sb.flags & ~(CFS_SB_FLAG_RAW | CFS_SB_FLAG_REMOVABLE |
                              CFS_SB_FLAG_ROTATIONAL | CFS_SB_FLAG_SD))
                 vprob(&v, C_SB, 0, "unknown flag bits 0x%04x set", (unsigned)(sb.flags & 0xFFF0));

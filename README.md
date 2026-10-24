@@ -9,7 +9,10 @@
 
 `cfs` is a container format (`LIBCFS02`) and the tools around it:
 
-- **Container**: superblock + inode table + CPEnc-compressed blocks. Ordinary
+- **Container**: two superblock slots (sequence number + CRC32, so a torn
+  write falls back to the older slot), an inode table, and CPEnc-compressed
+  blocks. A commit writes the data, then a new table in free space, then the
+  slot that is not live — the live table is never overwritten. Ordinary
   files are split at 64MB; the `@block` virtual block device splits at 8MB,
   which caps the decompress-modify-recompress cost of a random write.
 - **The container is a virtual disk.** `@block` carries a standard partition

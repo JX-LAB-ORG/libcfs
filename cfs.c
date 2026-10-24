@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <time.h>
 #include <errno.h>
+#include <signal.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/file.h>
@@ -66,10 +67,10 @@ static int cfs_phys_room(CFS *c, off_t off, size_t n) {
     /* An in-place rewrite of an existing block may not extend the file, so
      * the projection is the file's own end when that is further out. */
     if (end > 0 && (uint64_t)end > proj) proj = (uint64_t)end;
-    /* The inode table and the superblock are written past the data and are
+    /* The inode table and the slot region are written past the data and are
      * never refused, so keep room for them — otherwise a container sitting
      * exactly at its quota would still grow by the table on the next sync. */
-    proj += (uint64_t)c->sb.inode_size + CFS_SB_SIZE;
+    proj += (uint64_t)c->sb.inode_size + CFS_SB_REGION;
     if (proj > c->phys_limit) { errno = ENOSPC; return CFS_ENOSPC; }
     return 0;
 }
@@ -77,14 +78,137 @@ static int cfs_phys_room(CFS *c, off_t off, size_t n) {
 static ssize_t cfs_pw(CFS *c, const void *b, size_t n, off_t off) {
     int rc = cfs_phys_room(c, off, n);
     if (rc) { errno = ENOSPC; return -1; }
-    return pwrite(c->fd, b, n, off);
+    ssize_t w = pwrite(c->fd, b, n, off);
+    /* A full filesystem can accept a prefix of the write and report only the
+     * bytes that landed (tmpfs does this when the page allocation that would
+     * extend the file fails).  Treat a short write as "no room": every caller
+     * expects all-or-nothing, and a short one leaves errno untouched. */
+    if (w >= 0 && (size_t)w != n) { errno = ENOSPC; return -1; }
+    return w;
 }
 
 static ssize_t cfs_pw_meta(CFS *c, const void *b, size_t n, off_t off) {
-    return pwrite(c->fd, b, n, off);
+    ssize_t w = pwrite(c->fd, b, n, off);
+    if (w >= 0 && (size_t)w != n) { errno = ENOSPC; return -1; }
+    return w;
 }
 
-/* ── Write superblock + inode table to disk ────────────────────── */
+/* ── Fault injection for the crash-consistency test ─────────────
+ * test/cfs_crash_test.c runs a child with CFS_CRASH_STAGE set to one of the
+ * names below and expects it to die by SIGKILL at exactly that point.  The
+ * windows are too narrow to hit by racing, so the code kills itself.  With
+ * the variable unset this is a no-op, and it cannot fire in a normal run. */
+static void cfs_crash_stage(const char *stage) {
+    const char *s = getenv("CFS_CRASH_STAGE");
+    if (s && *s && !strcmp(s, stage)) {
+        fflush(NULL);
+        raise(SIGKILL);
+    }
+}
+
+/* ── Superblock slots ───────────────────────────────────────────
+ * The current superblock lives in one of two 512-byte sectors.  A commit
+ * writes the data, then the table, then the slot that is NOT live, and only
+ * then updates the in-memory view: at any instant the newest valid slot
+ * points at a complete table.  sb_commit() writes a v3 record with a
+ * sequence number and a CRC over its own fields, so a torn sector write
+ * fails validation and the reader falls back to the other slot. */
+static int sb_commit(CFS *c, int slot, uint32_t seq,
+                     uint64_t table_off, uint32_t table_size) {
+    CfsSuperBlock sb = c->sb;
+    sb.version      = CFS_VERSION;
+    sb.inode_offset = table_off;
+    sb.inode_size   = table_size;
+    sb.file_count   = c->inode_count;
+    uint8_t rec[CFS_SB_REC_SIZE];
+    cfs_sb_encode(rec, &sb, seq);
+    if (cfs_pw_meta(c, rec, sizeof rec,
+                    (off_t)slot * CFS_SB_SLOT_SIZE) != (ssize_t)sizeof rec)
+        return -1;
+    c->slot_valid[slot] = 1;
+    c->slot_off[slot]  = table_off;
+    c->slot_size[slot] = table_size;
+    c->sb        = sb;
+    c->sb_slot   = slot;
+    c->sb_seq    = seq;
+    c->legacy    = 0;
+    return 0;
+}
+
+/* Point a still-v2 primary slot at a table that is already on disk.  Used
+ * once, while upgrading a legacy container: the 40 legacy fields at offset 0
+ * do not reach the seq/CRC bytes at 36..43, so a crash leaves either the old
+ * or the new legacy record, and both point at a complete table. */
+static int sb_write_legacy(CFS *c, uint64_t table_off, uint32_t table_size) {
+    CfsSuperBlock sb = c->sb;
+    sb.version      = CFS_VERSION_LEGACY;
+    sb.inode_offset = table_off;
+    sb.inode_size   = table_size;
+    sb.file_count   = c->inode_count;
+    uint8_t rec[CFS_SB_SIZE];
+    memset(rec, 0, sizeof rec);
+    memcpy(rec, sb.magic, 8);
+    cfs_wr16(rec + 8,  sb.version);
+    cfs_wr64(rec + 10, sb.inode_offset);
+    cfs_wr32(rec + 18, sb.inode_size);
+    cfs_wr32(rec + 22, sb.file_count);
+    cfs_wr64(rec + 26, sb.created_at);
+    cfs_wr16(rec + 34, sb.flags);
+    return cfs_pw_meta(c, rec, sizeof rec, 0) == (ssize_t)sizeof rec ? 0 : -1;
+}
+
+/* Do any live data blocks intersect [start, end)? */
+static int blocks_overlap(CFS *c, uint64_t start, uint64_t end) {
+    for (uint32_t i = 0; i < c->inode_count; i++)
+        for (uint32_t b = 0; b < c->inodes[i].raw.block_count; b++) {
+            const CfsBlock *bl = &c->inodes[i].raw.blocks[b];
+            if (bl->comp_size && bl->offset < end &&
+                start < bl->offset + (uint64_t)bl->comp_size)
+                return 1;
+        }
+    return 0;
+}
+
+/* A v2 container's first block can start at offset 40 and its table can sit
+ * anywhere the old append cursor left it, so both may overlap the 1024-byte
+ * slot region.  Copy every live block that does past CFS_SB_REGION and
+ * repoint its inode entry.  The old bytes stay where they are, so the v2
+ * record still describes a complete (pre-upgrade) container until the new
+ * table is committed; the old table itself is superseded by that commit. */
+static int upgrade_relocate(CFS *c) {
+    if (c->append_off < CFS_SB_REGION) c->append_off = CFS_SB_REGION;
+    for (uint32_t i = 0; i < c->inode_count; i++) {
+        InodeEntry *e = &c->inodes[i];
+        for (uint32_t b = 0; b < e->raw.block_count; b++) {
+            CfsBlock *bl = &e->raw.blocks[b];
+            if (bl->comp_size == 0 || bl->offset >= CFS_SB_REGION) continue;
+            uint8_t *buf = malloc(bl->comp_size);
+            if (!buf) return -1;
+            if (pread(c->fd, buf, bl->comp_size, (off_t)bl->offset) !=
+                    (ssize_t)bl->comp_size ||
+                cfs_pw_meta(c, buf, bl->comp_size, (off_t)c->append_off) !=
+                    (ssize_t)bl->comp_size) {
+                free(buf);
+                return -1;
+            }
+            free(buf);
+            bl->offset = c->append_off;
+            c->append_off += bl->comp_size;
+        }
+    }
+    return 0;
+}
+
+/* ── Write superblock + inode table to disk ──────────────────────
+ * Order: data (already appended by the caller) -> new inode table -> the
+ * slot that is not live -> fsync.  The live table is never touched: it is
+ * the region the newest valid slot points at.  The new table may reuse the
+ * *other* slot's region, because that slot's record is about to be
+ * overwritten and a crash before then leaves the newer, untouched slot
+ * pointing at the intact live table.  When it does not fit there it lands
+ * after the data, which is what makes a long series of metadata-only syncs
+ * stop growing the file (the old code moved the table to the previous
+ * table's end on every sync). */
 static int cfs_sync(CFS *c) {
     volatile uint64_t canary_a = 0xCAFEBABECAFEBABEULL;
     volatile uint64_t canary_b = 0xDEADBEEFDEADBEEFULL;
@@ -95,12 +219,21 @@ static int cfs_sync(CFS *c) {
     if (dedup_pend_flush(c) != 0) return -1;
     if (dedup_table_flush(c) != 0) return -1;
 
+    /* Crash window (b): every data block is on disk, no new table yet.  A
+     * reboot must land on the previous superblock and lose only this write. */
+    cfs_crash_stage("after-data");
+
+    /* v2 upgrade: get every live block out of the slot region before
+     * anything is written there.  Before serialising, because it rewrites
+     * block offsets. */
+    if (c->legacy && upgrade_relocate(c) != 0) return -1;
+
     /* Serialise inode table */
     size_t ts = 0;
     for (uint32_t i = 0; i < c->inode_count; i++)
         ts += CFS_INODE_FIXED_SIZE + (size_t)c->inodes[i].raw.block_count * 16
             + c->inodes[i].raw.path_len;
-    uint8_t *tab = calloc(1, ts);
+    uint8_t *tab = calloc(1, ts ? ts : 1);
     if (!tab) return -1;
     uint8_t *op = tab;
     for (uint32_t i = 0; i < c->inode_count; i++) {
@@ -118,7 +251,7 @@ static int cfs_sync(CFS *c) {
         memcpy(op, e->path, e->raw.path_len);
         op += e->raw.path_len;
     }
-    c->sb.inode_size = (uint32_t)(op - tab);
+    uint32_t tsz = (uint32_t)(op - tab);
 
     /* Find physical end of last data block */
     uint64_t data_end = CFS_SB_SIZE;
@@ -148,35 +281,62 @@ static int cfs_sync(CFS *c) {
         ? (float)c->st.total_orig_size / (float)c->st.total_compressed_size : 1.0f;
     c->sb.file_count = c->inode_count;
 
-    /* Write inode table after last data block, then superblock.
-     * Table position is monotonic: it lands at the append cursor, or after
-     * the data when the last writer appended without moving the cursor
-     * (block_patch advances its own local cursor).  The floor used to be the
-     * *previous table's end*, which grew the container by a whole table on
-     * every sync even when no data was written — 2000 x 400 B files cost
-     * 98 MB — and that slack is what made per-file reference tables look
-     * expensive.  The cursor itself is enough: every data append starts
-     * there, and no path moves it backward. */
-    uint64_t io = data_end > c->sb.inode_offset ? data_end : c->sb.inode_offset;
-    off_t io_off = (off_t)io;
-    if (cfs_pw_meta(c, tab, c->sb.inode_size, io_off) != (ssize_t)c->sb.inode_size) {
-        free(tab); return -1;
+    /* Regions that must survive this commit */
+    int live = c->sb_slot;
+    uint64_t live_off = c->slot_off[live];
+    uint64_t live_end = live_off + c->slot_size[live];
+    int target = live ^ 1;
+    int was_legacy = c->legacy;
+
+    uint64_t io = c->append_off;
+    if (data_end > io) io = data_end;
+    if (live_end > io) io = live_end;
+
+    /* Reuse the older slot's table region when the new table fits there and
+     * nothing live is in the way.  That region is only referenced by the
+     * record this commit overwrites; before that write, the newest valid
+     * record (the live slot) is the one a reader uses, and it is untouched. */
+    if (c->slot_valid[target] && c->slot_size[target] > 0 &&
+        c->slot_off[target] >= CFS_SB_REGION && tsz <= c->slot_size[target]) {
+        uint64_t oo = c->slot_off[target];
+        uint64_t oend = oo + c->slot_size[target];
+        if (!(oo < live_end && live_off < oend) &&
+            !blocks_overlap(c, oo, oo + tsz))
+            io = oo;
     }
-    c->sb.inode_offset = (uint64_t)io_off;
+    if (io < CFS_SB_REGION) io = CFS_SB_REGION;
+
+    if (cfs_pw_meta(c, tab, tsz, (off_t)io) != (ssize_t)tsz) {
+        free(tab);
+        return -1;
+    }
     free(tab);
 
-    /* Build and write superblock */
-    uint8_t sb[CFS_SB_SIZE];
-    memset(sb, 0, CFS_SB_SIZE);
-    memcpy(sb, CFS_MAGIC, 8);
-    wr16(sb + 8,  (uint16_t)c->sb.version);
-    wr64(sb + 10, c->sb.inode_offset);
-    wr32(sb + 18, c->sb.inode_size);
-    wr32(sb + 22, c->sb.file_count);
-    wr64(sb + 26, c->sb.created_at);
-    wr16(sb + 34, c->sb.flags);
-    if (cfs_pw_meta(c, sb, CFS_SB_SIZE, 0) != CFS_SB_SIZE) return -1;
+    /* Crash window (c): the new table is complete, no slot points at it. */
+    cfs_crash_stage("before-slot");
+
+    /* Upgrading a v2 container: if the live table intersects the backup
+     * slot's 44 bytes, the backup write itself could damage the only record
+     * that still describes a valid container.  Point the primary at the new
+     * table in v2 form first (40 bytes, no seq/CRC), so a crash during the
+     * backup write still finds a v2 record describing a complete table. */
+    int shield = 0;
+    if (was_legacy) {
+        uint64_t s = CFS_SB_SLOT_SIZE, se = s + CFS_SB_REC_SIZE;
+        shield = (live_off < se && s < live_end);
+    }
+    uint32_t seq = c->sb_seq + 1;
+    if (shield && sb_write_legacy(c, io, tsz) != 0) return -1;
+    if (sb_commit(c, target, seq, io, tsz) != 0) return -1;
+    if (was_legacy) {
+        /* Seal the primary as a v3 record too.  Its 44 bytes may reach into
+         * [40,44), which upgrade_relocate() has already emptied. */
+        if (sb_commit(c, live, seq + 1, io, tsz) != 0) return -1;
+    }
     if (fsync(c->fd) != 0) return -1;
+
+    if (io + tsz > c->append_off) c->append_off = io + tsz;
+    if (c->append_off < CFS_SB_REGION) c->append_off = CFS_SB_REGION;
     c->dirty = 0;                     /* in-memory table is now on disk */
     if (canary_a != 0xCAFEBABECAFEBABEULL || canary_b != 0xDEADBEEFDEADBEEFULL)
         write(2, "CANARY CORRUPT in cfs_sync\n", 27);
@@ -199,7 +359,13 @@ CFS *cfs_create(const char *path) {
     memcpy(c->sb.magic, CFS_MAGIC, 8);
     c->sb.version = CFS_VERSION;
     c->sb.created_at = (uint64_t)time(NULL);
-    c->sb.inode_offset = CFS_SB_SIZE;
+    c->sb.inode_offset = CFS_SB_REGION;
+    c->sb.inode_size = 0;
+    /* Both slots start invalid; the first commit writes slot 0 (sb_slot 1 is
+     * merely "the other one").  Data and tables live past the slot region. */
+    c->sb_slot = 1;
+    c->sb_seq = 0;
+    c->append_off = CFS_SB_REGION;
     /* Write initial superblock */
     if (cfs_sync(c) != 0) { close(c->fd); free(c); return NULL; }
     return c;
@@ -213,20 +379,41 @@ int cfs_set_raw(CFS *c) {
 }
 
 /* ── Add file (builder API) ───────────────────────────────── */
+/* Build a RAW block payload: 12-byte header, lag byte, data, and the v8
+ * CRC32 trailer.  Blocks built by hand have to match what the encoder emits,
+ * or a container we write is one its own decoder and `verify --deep` refuse:
+ * with CPENC_VERSION 8 the trailer is part of compressed_size (everything
+ * after the header), and the CRC is over the original bytes — which for RAW
+ * is the payload itself. */
+static uint8_t *raw_block_build(const void *data, size_t len, size_t *out_len) {
+    size_t cl = CPENC_HEADER_SIZE + 1 + len + 4;
+    uint8_t *b = malloc(cl);
+    if (!b) return NULL;
+    CPEncHeader *h = (CPEncHeader *)b;
+    memset(h, 0, CPENC_HEADER_SIZE);
+    h->magic = CPENC_MAGIC; h->version = CPENC_VERSION;
+    h->stride = CPENC_STRIDE_RAW;
+    h->original_size = (uint32_t)len;
+    h->compressed_size = (uint32_t)(1 + len + 4);
+    b[CPENC_HEADER_SIZE] = CPENC_LAG_NONE;
+    if (len) memcpy(b + CPENC_HEADER_SIZE + 1, data, len);
+    uint32_t crc = cpenc_crc32(data, len);
+    b[cl - 4] = (uint8_t)(crc & 0xFF);
+    b[cl - 3] = (uint8_t)((crc >> 8) & 0xFF);
+    b[cl - 2] = (uint8_t)((crc >> 16) & 0xFF);
+    b[cl - 1] = (uint8_t)((crc >> 24) & 0xFF);
+    *out_len = cl;
+    return b;
+}
+
 int cfs_add_file(CFS *c, const char *vpath, const void *buf, size_t size) {
     if(!c||!vpath||!buf||size==0) return -1;
     size_t cl=0; uint8_t *comp=NULL;
 
     if(c->flags & CFS_RAW){
         /* Store uncompressed: CPEnc RAW header + lag byte + raw data */
-        cl = CPENC_HEADER_SIZE + 1 + size;
-        comp = malloc(cl);
-        if(!comp) return -1;
-        CPEncHeader *rh = (CPEncHeader*)comp;
-        memset(rh,0,CPENC_HEADER_SIZE);rh->magic=CPENC_MAGIC;rh->version=CPENC_VERSION;
-        rh->stride=CPENC_STRIDE_RAW;rh->original_size=(uint32_t)size;rh->compressed_size=(uint32_t)(1+size);
-        comp[CPENC_HEADER_SIZE]=CPENC_LAG_NONE;
-        memcpy(comp+CPENC_HEADER_SIZE+1, buf, size);
+        comp = raw_block_build(buf, size, &cl);
+        if (!comp) return -1;
     }else{
         size_t mc=cpenc_max_compressed_size(size);
         comp=malloc(mc); if(!comp)return -1;
@@ -234,12 +421,11 @@ int cfs_add_file(CFS *c, const char *vpath, const void *buf, size_t size) {
         if(cpenc_compress(buf,size,comp,&cl,2)!=0){free(comp);return -1;}
     }
 
-    off_t write_off = (off_t)c->sb.inode_offset;
+    off_t write_off = (off_t)c->append_off;
     if(cfs_pw(c,comp,cl,write_off)!=(ssize_t)cl){free(comp);return -1;}
     /* Move the append cursor past the block, so a sync that flushes pending
      * @store bytes cannot land them on top of it (see cfs_write). */
-    c->sb.inode_offset = (uint64_t)write_off + cl;
-    c->sb.inode_size = 0;
+    c->append_off = (uint64_t)write_off + cl;
 
     InodeEntry *na=realloc(c->inodes,(c->inode_count+1)*sizeof(InodeEntry));
     if(!na){free(comp);return -1;} c->inodes=na;
@@ -310,19 +496,52 @@ CFS *cfs_open(const char *path, int flags) {
         if (lim && *lim) c->phys_limit = strtoull(lim, NULL, 0);
     }
 
-    uint8_t sb[CFS_SB_SIZE];
+    uint8_t rec0[CFS_SB_REC_SIZE], rec1[CFS_SB_REC_SIZE];
+    CfsSbSlot s[2];
     uint8_t *it = NULL;      /* raw inode table; freed on every exit path */
-    if (pread(c->fd, sb, CFS_SB_SIZE, 0) != CFS_SB_SIZE) goto fail;
-    if (memcmp(sb, CFS_MAGIC, 8) || rd16(sb + 8) != CFS_VERSION) {
+    ssize_t n0 = pread(c->fd, rec0, sizeof rec0, 0);
+    ssize_t n1 = pread(c->fd, rec1, sizeof rec1, (off_t)CFS_SB_SLOT_SIZE);
+    cfs_sb_decode(rec0, n0 > 0 ? (size_t)n0 : 0, &s[0]);
+    cfs_sb_decode(rec1, n1 > 0 ? (size_t)n1 : 0, &s[1]);
+    /* A v2 record is only a superblock in slot 0.  In slot 1 those bytes are
+     * an old container's data, not a second copy, and must never be used. */
+    if (s[1].kind == CFS_SB_SLOT_LEGACY) s[1].kind = CFS_SB_SLOT_INVALID;
+
+    int pick;
+    if (s[0].kind && s[1].kind)
+        pick = (s[1].seq > s[0].seq) ? 1 : 0;    /* tie: the primary */
+    else if (s[0].kind)
+        pick = 0;
+    else if (s[1].kind)
+        pick = 1;
+    else
         goto fail;
+
+    /* If a slot looks like a record but failed its CRC, that is the torn
+     * write this format is built to survive: say so, and say which older
+     * state was used instead.  Zeroed/unused slots stay quiet. */
+    for (int i = 0; i < 2; i++) {
+        if (i == pick || s[i].kind != CFS_SB_SLOT_INVALID) continue;
+        const uint8_t *r = i == 0 ? rec0 : rec1;
+        size_t n = i == 0 ? (n0 > 0 ? (size_t)n0 : 0) : (n1 > 0 ? (size_t)n1 : 0);
+        if (n >= CFS_SB_SIZE && !memcmp(r, CFS_MAGIC, CFS_MAGIC_LEN)) {
+            uint16_t v = cfs_rd16(r + 8);
+            if (v == CFS_VERSION || v == CFS_VERSION_LEGACY)
+                fprintf(stderr, "libcfs: superblock slot %d failed its CRC; "
+                        "recovered slot %d (sequence %u)\n",
+                        i, pick, (unsigned)s[pick].seq);
+        }
     }
-    memcpy(c->sb.magic, sb, 8);
-    c->sb.version      = rd16(sb + 8);
-    c->sb.inode_offset = rd64(sb + 10);
-    c->sb.inode_size   = rd32(sb + 18);
-    c->sb.file_count   = rd32(sb + 22);
-    c->sb.created_at   = rd64(sb + 26);
-    c->sb.flags        = rd16(sb + 34);
+
+    c->sb = s[pick].sb;
+    c->sb_slot = pick;
+    c->sb_seq  = s[pick].seq;
+    c->legacy  = (s[pick].kind == CFS_SB_SLOT_LEGACY);
+    for (int i = 0; i < 2; i++) {
+        c->slot_off[i]  = s[i].kind ? s[i].sb.inode_offset : 0;
+        c->slot_size[i] = s[i].kind ? s[i].sb.inode_size : 0;
+        c->slot_valid[i] = s[i].kind != CFS_SB_SLOT_INVALID;
+    }
     /* container self-describes: RAW flag on disk forces uncompressed mode
      * regardless of the caller's open flags */
     if (c->sb.flags & CFS_SB_FLAG_RAW) c->flags |= CFS_RAW;
@@ -333,13 +552,31 @@ CFS *cfs_open(const char *path, int flags) {
      * the process allocating them before any parser sees the contents —
      * fuzzing the container parser found exactly that, as an out-of-memory
      * far from any crash inside cfs.  The table has to fit in the file, and
-     * the entry count has to fit in the table. */
+     * the entry count has to fit in the table.  A zero-sized table may sit
+     * past the end of the file: there is nothing to read. */
     off_t fsz = lseek(c->fd, 0, SEEK_END);
     if (fsz < 0) goto fail;
-    if ((uint64_t)c->sb.inode_offset + (uint64_t)c->sb.inode_size > (uint64_t)fsz)
-        goto fail;
+    {
+        uint64_t ioff = c->sb.inode_offset, isz = c->sb.inode_size;
+        /* Subtract rather than add: both fields are untrusted, and
+         * ioff + isz can wrap. */
+        if (isz && (ioff < CFS_SB_SIZE || ioff > (uint64_t)fsz ||
+                    isz > (uint64_t)fsz - ioff))
+            goto fail;
+    }
     if (c->sb.file_count > c->sb.inode_size / CFS_INODE_FIXED_SIZE)
         goto fail;
+    if (!c->legacy && c->sb.inode_size && c->sb.inode_offset < CFS_SB_REGION)
+        goto fail;
+
+    /* First cut at the append cursor: past both slots' tables.  The block
+     * high-water is folded in as the table is parsed. */
+    c->append_off = CFS_SB_REGION;
+    for (int i = 0; i < 2; i++)
+        if (c->slot_valid[i] &&
+            c->slot_off[i] + c->slot_size[i] > c->append_off)
+            c->append_off = c->slot_off[i] + c->slot_size[i];
+
     if (c->sb.file_count == 0) return c;
 
     it = malloc(c->sb.inode_size);
@@ -395,6 +632,8 @@ CFS *cfs_open(const char *path, int flags) {
                 if (hb[3] != CPENC_STRIDE_HEX && rd32(hb + 4) != bl->orig_size) goto fail;
                 if ((uint64_t)rd32(hb + 8) + CPENC_HEADER_SIZE != bl->comp_size) goto fail;
             }
+            if ((uint64_t)bl->offset + bl->comp_size > c->append_off)
+                c->append_off = (uint64_t)bl->offset + bl->comp_size;
         }
         /* The path has to be there.  Leaving e->path NULL with a non-zero
          * path_len used to "work" for reads — lu() checks for NULL — and
@@ -575,6 +814,8 @@ void cfs_stats(CFS *c,CfsStats *out){if(c&&out)*out=c->st;}
    ═══════════════════════════════════════════════════════════════════ */
 int cfs_write(CFS *c, const char *path, const void *buf, size_t size) {
     if (!c || !(c->flags & CFS_RDWR) || !path) return -1;
+    /* Crash window (a): nothing of this write has reached the file yet. */
+    cfs_crash_stage("before-data");
     if (size == 0) {
         /* Touch: create or clear to 0 bytes */
         InodeEntry *e = lu(c, path);
@@ -623,14 +864,8 @@ int cfs_write(CFS *c, const char *path, const void *buf, size_t size) {
         size_t bs = bo + CFS_BLOCK_SPLIT <= size ? CFS_BLOCK_SPLIT : size - bo;
 
         if (c->flags & CFS_RAW) {
-            blks[b].cl = CPENC_HEADER_SIZE + 1 + bs;
-            blks[b].data = malloc(blks[b].cl);
+            blks[b].data = raw_block_build((const uint8_t*)buf + bo, bs, &blks[b].cl);
             if (!blks[b].data) { ok = 0; break; }
-            CPEncHeader *rh = (CPEncHeader*)blks[b].data;
-            memset(rh,0,CPENC_HEADER_SIZE);rh->magic=CPENC_MAGIC;rh->version=CPENC_VERSION;
-            rh->stride=CPENC_STRIDE_RAW;rh->original_size=(uint32_t)bs;rh->compressed_size=(uint32_t)(1+bs);
-            blks[b].data[CPENC_HEADER_SIZE]=CPENC_LAG_NONE;
-            memcpy(blks[b].data+CPENC_HEADER_SIZE+1,(const uint8_t*)buf+bo,bs);
         } else {
             size_t mc = cpenc_max_compressed_size(bs);
             blks[b].data = malloc(mc);
@@ -653,7 +888,7 @@ int cfs_write(CFS *c, const char *path, const void *buf, size_t size) {
     {
         uint64_t tot = 0;
         for (uint32_t b = 0; b < n_blocks; b++) tot += blks[b].cl;
-        if (cfs_phys_room(c, (off_t)c->sb.inode_offset, (size_t)tot)) {
+        if (cfs_phys_room(c, (off_t)c->append_off, (size_t)tot)) {
             for (uint32_t b = 0; b < n_blocks; b++) free(blks[b].data);
             free(blks); return CFS_ENOSPC;
         }
@@ -688,7 +923,7 @@ int cfs_write(CFS *c, const char *path, const void *buf, size_t size) {
     }
 
     /* Write blocks sequentially */
-    uint64_t cur_off = c->sb.inode_offset;
+    uint64_t cur_off = c->append_off;
     for (uint32_t b = 0; b < n_blocks; b++) {
         if (cfs_pw(c, blks[b].data, blks[b].cl, (off_t)cur_off) != (ssize_t)blks[b].cl) {
             ok = 0; break;
@@ -711,13 +946,12 @@ int cfs_write(CFS *c, const char *path, const void *buf, size_t size) {
 
     /* Advance the append cursor past the blocks just written.  cfs_sync()
      * flushes pending @store bytes *before* it writes the inode table, and it
-     * appends them through this cursor: leaving it at the old table position
-     * made the store slab land on top of the block appended here, which broke
-     * both the block and (once the block table pointed at the overwritten
-     * header) the container's ability to open at all.  Every other appender
+     * appends them through this cursor: leaving it at the old position made
+     * the store slab land on top of the block appended here, which broke both
+     * the block and (once the block table pointed at the overwritten header)
+     * the container's ability to open at all.  Every other appender
      * (store_append, dedup_write_table, truncate, gc) already moves it. */
-    c->sb.inode_offset = cur_off;
-    c->sb.inode_size = 0;
+    c->append_off = cur_off;
 
     e->raw.orig_size   = size;
     e->raw.mtime       = (uint64_t)time(NULL);
@@ -942,10 +1176,10 @@ int cfs_truncate(CFS *c, const char *path, uint64_t size) {
              * and store slab, and the container stopped opening at all while
              * truncate still returned success.  Append it and move the block
              * instead; the old bytes stay as garbage for compact to reclaim. */
-            off_t wo = (off_t)c->sb.inode_offset;
+            off_t wo = (off_t)c->append_off;
             if (cfs_pw(c, comp, cl, wo) != (ssize_t)cl) { free(comp); return -1; }
             lb_blk->offset = (uint64_t)wo;
-            c->sb.inode_offset = (uint64_t)wo + cl;
+            c->append_off = (uint64_t)wo + cl;
         }
         lb_blk->comp_size = (uint32_t)cl;
         lb_blk->orig_size = (uint32_t)rem;
@@ -979,19 +1213,16 @@ int cfs_symlink(CFS *c, const char *target, const char *linkpath) {
     c->inode_count++;
 
     /* Store target string as a single uncompressed (RAW) block for simplicity */
-    off_t wo = (off_t)c->sb.inode_offset;
-    uint8_t hdr[CPENC_HEADER_SIZE + 1]; memset(hdr, 0, sizeof(hdr));
-    CPEncHeader *h = (CPEncHeader*)hdr;
-    h->magic = CPENC_MAGIC; h->version = CPENC_VERSION;
-    h->stride = CPENC_STRIDE_RAW; h->original_size = (uint32_t)tl;
-    h->compressed_size = (uint32_t)(1 + tl);
-    hdr[CPENC_HEADER_SIZE] = CPENC_LAG_NONE;
-    if (cfs_pw(c, hdr, CPENC_HEADER_SIZE + 1, wo) != CPENC_HEADER_SIZE + 1 ||
-        cfs_pw(c, target, tl, wo + CPENC_HEADER_SIZE + 1) != (ssize_t)tl)
-        { free(e->path); c->inode_count--; return -1; }
+    off_t wo = (off_t)c->append_off;
+    size_t sl_cl = 0;
+    uint8_t *sl_blk = raw_block_build(target, tl, &sl_cl);
+    if (!sl_blk) { free(e->path); c->inode_count--; return -1; }
+    if (cfs_pw(c, sl_blk, sl_cl, wo) != (ssize_t)sl_cl) {
+        free(sl_blk); free(e->path); c->inode_count--; return -1;
+    }
+    free(sl_blk);
     /* Same cursor discipline as every other appender (see cfs_write). */
-    c->sb.inode_offset = (uint64_t)wo + CPENC_HEADER_SIZE + 1 + tl;
-    c->sb.inode_size = 0;
+    c->append_off = (uint64_t)wo + sl_cl;
 
     e->raw.orig_size   = tl;
     e->raw.mtime       = (uint64_t)time(NULL);
@@ -999,7 +1230,7 @@ int cfs_symlink(CFS *c, const char *target, const char *linkpath) {
     e->raw.path_len    = (uint16_t)strlen(linkpath);
     if (inode_grow_blocks(e, 1) != 0) { free(e->path); c->inode_count--; return -1; }
     e->raw.blocks[0].offset    = (uint64_t)wo;
-    e->raw.blocks[0].comp_size = CPENC_HEADER_SIZE + 1 + (uint32_t)tl;
+    e->raw.blocks[0].comp_size = (uint32_t)sl_cl;   /* includes the v8 CRC trailer */
     e->raw.blocks[0].orig_size = (uint32_t)tl;
     return cfs_sync(c);
 }
@@ -1113,8 +1344,9 @@ int cfs_compact(CFS *c) {
     int tfd = mkstemp(tmp);
     if (tfd < 0) return -1;
 
-    /* Walk inodes, copy active blocks to temp file */
-    uint64_t cur_off = CFS_SB_SIZE;
+    /* Walk inodes, copy active blocks to temp file.  The rebuilt container
+     * uses the v3 layout: the slot region is reserved, data starts after it. */
+    uint64_t cur_off = CFS_SB_REGION;
     /* Inodes will be rebuilt with new offsets */
     for (uint32_t i = 0; i < c->inode_count; i++) {
         InodeEntry *e = &c->inodes[i];
@@ -1145,7 +1377,7 @@ int cfs_compact(CFS *c) {
     for (uint32_t i = 0; i < c->inode_count; i++)
         ts += CFS_INODE_FIXED_SIZE + (size_t)c->inodes[i].raw.block_count * 16
             + c->inodes[i].raw.path_len;
-    uint8_t *tab = calloc(1, ts);
+    uint8_t *tab = calloc(1, ts ? ts : 1);
     if (!tab) { close(tfd); unlink(tmp); return -1; }
     uint8_t *op = tab;
     for (uint32_t i = 0; i < c->inode_count; i++) {
@@ -1169,20 +1401,30 @@ int cfs_compact(CFS *c) {
     }
     free(tab);
 
-    /* Build and write superblock */
-    uint8_t sb[CFS_SB_SIZE];
-    memset(sb, 0, CFS_SB_SIZE);
-    memcpy(sb, CFS_MAGIC, 8);
-    wr16(sb + 8,  CFS_VERSION);
-    wr64(sb + 10, (uint64_t)inode_off);
-    wr32(sb + 18, (uint32_t)ts);
-    wr32(sb + 22, c->inode_count);
-    wr64(sb + 26, (uint64_t)time(NULL));
-    wr16(sb + 34, c->sb.flags);          /* keep RAW containers self-describing */
-    if (pwrite(tfd, sb, CFS_SB_SIZE, 0) != CFS_SB_SIZE) {
-        close(tfd); unlink(tmp); return -1;
+    /* Both slots describe the table just written; the higher sequence wins,
+     * so a torn rewrite of either one still leaves the other usable.  The
+     * rename below is atomic, so a crash during this whole pass leaves the
+     * old container untouched. */
+    {
+        CfsSuperBlock nsb;
+        memset(&nsb, 0, sizeof nsb);
+        memcpy(nsb.magic, CFS_MAGIC, 8);
+        nsb.version      = CFS_VERSION;
+        nsb.inode_offset = (uint64_t)inode_off;
+        nsb.inode_size   = (uint32_t)ts;
+        nsb.file_count   = c->inode_count;
+        nsb.created_at   = (uint64_t)time(NULL);
+        nsb.flags        = c->sb.flags;   /* keep RAW containers self-describing */
+        for (int slot = 0; slot < CFS_SB_SLOTS; slot++) {
+            uint8_t rec[CFS_SB_REC_SIZE];
+            cfs_sb_encode(rec, &nsb, (uint32_t)slot + 1);
+            if (pwrite(tfd, rec, sizeof rec,
+                       (off_t)slot * CFS_SB_SLOT_SIZE) != (ssize_t)sizeof rec) {
+                close(tfd); unlink(tmp); return -1;
+            }
+        }
     }
-    fsync(tfd);
+    if (fsync(tfd) != 0) { close(tfd); unlink(tmp); return -1; }
 
     /* Atomic replace: rename temp over original */
     /* Get original path from /proc/self/fd since we only have fd */
@@ -1213,6 +1455,18 @@ int cfs_compact(CFS *c) {
     c->sb.inode_size   = (uint32_t)ts;
     c->sb.file_count   = c->inode_count;
     c->sb.created_at   = (uint64_t)time(NULL);
+    /* Slot 0 was written last (sequence 2); both point at the same table, so
+     * the next commit cannot reuse either region and appends instead. */
+    c->sb_slot = 0;
+    c->sb_seq = CFS_SB_SLOTS;
+    for (int i = 0; i < CFS_SB_SLOTS; i++) {
+        c->slot_off[i]  = (uint64_t)inode_off;
+        c->slot_size[i] = (uint32_t)ts;
+        c->slot_valid[i] = 1;
+    }
+    c->append_off = (uint64_t)inode_off + ts;
+    if (c->append_off < CFS_SB_REGION) c->append_off = CFS_SB_REGION;
+    c->legacy = 0;
     return 0;
 }
 
@@ -1371,8 +1625,12 @@ static int block_patch(CFS *c, InodeEntry *e, uint32_t b, const uint8_t *src,
          * bytes into a dec buffer sized for the uncompressed length wrote one
          * byte past the heap block per byte of payload and corrupted the
          * allocator (ASan: 544781-byte write into a 544768-byte region). */
-        size_t need = CPENC_HEADER_SIZE + 1 + olen;
-        if (blk->comp_size != need) { free(dec); return -1; }
+        /* 12-byte header + lag + data, plus the v8 CRC trailer when the block
+         * was written by this version.  Take the stored size rather than
+         * recomputing it, and accept exactly those two shapes. */
+        size_t need = blk->comp_size;
+        size_t base = CPENC_HEADER_SIZE + 1 + olen;
+        if (need != base && need != base + 4) { free(dec); return -1; }
         uint8_t *comp = malloc(need);
         if (!comp) { free(dec); return -1; }
         if (pread(c->fd, comp, need, (off_t)blk->offset) != (ssize_t)need) {
@@ -1404,33 +1662,31 @@ static int block_patch(CFS *c, InodeEntry *e, uint32_t b, const uint8_t *src,
     if (c->flags & CFS_RAW) {
         /* RAW payload = header + nolen; only in-place when size unchanged */
         if (ext) {
-            uint8_t *nc = malloc(CPENC_HEADER_SIZE + 1 + nolen);
-            if (!nc) { free(dec); return -1; }
-            CPEncHeader *h = (CPEncHeader*)nc;
-            memset(h, 0, CPENC_HEADER_SIZE);
-            h->magic = CPENC_MAGIC; h->version = CPENC_VERSION;
-            h->stride = CPENC_STRIDE_RAW;
-            h->original_size = nolen; h->compressed_size = (uint32_t)(1 + nolen);
-            nc[CPENC_HEADER_SIZE] = CPENC_LAG_NONE;
-            memcpy(nc + CPENC_HEADER_SIZE + 1, dec, nolen);
+            size_t nclen = 0;
+            uint8_t *nc = raw_block_build(dec, nolen, &nclen);
             free(dec);
+            if (!nc) return -1;
             pend_data[*np] = nc; pend_idx[*np] = b; pend_orig[*np] = nolen;
-            pend_cl[*np] = CPENC_HEADER_SIZE + 1 + nolen; (*np)++;
+            pend_cl[*np] = nclen; (*np)++;
             return 0;
         }
         /* rewrite the payload in place (same size) */
-        uint8_t *nc = malloc(CPENC_HEADER_SIZE + 1 + olen);
-        if (!nc) { free(dec); return -1; }
-        CPEncHeader *h = (CPEncHeader*)nc;
-        memset(h, 0, CPENC_HEADER_SIZE);
-        h->magic = CPENC_MAGIC; h->version = CPENC_VERSION;
-        h->stride = CPENC_STRIDE_RAW;
-        h->original_size = nolen; h->compressed_size = (uint32_t)(1 + nolen);
-        nc[CPENC_HEADER_SIZE] = CPENC_LAG_NONE;
-        memcpy(nc + CPENC_HEADER_SIZE + 1, dec, olen);
+        size_t nclen = 0;
+        uint8_t *nc = raw_block_build(dec, olen, &nclen);
         free(dec);
-        if (cfs_pw(c, nc, CPENC_HEADER_SIZE + 1 + olen, (off_t)blk->offset) != (ssize_t)(CPENC_HEADER_SIZE + 1 + olen))
+        if (!nc) return -1;
+        /* In place only if it still fits: a block written before v8 carries no
+         * CRC trailer, so the rebuilt payload is four bytes larger and would
+         * run into whatever follows.  Otherwise queue it as an appended block,
+         * the same way a grown compressed payload is handled. */
+        if (nclen > blk->comp_size) {
+            pend_data[*np] = nc; pend_idx[*np] = b; pend_orig[*np] = nolen;
+            pend_cl[*np] = nclen; (*np)++;
+            return 0;
+        }
+        if (cfs_pw(c, nc, nclen, (off_t)blk->offset) != (ssize_t)nclen)
             { free(nc); return -1; }
+        blk->comp_size = (uint32_t)nclen;
         blk->orig_size = nolen;
         free(nc);
         return 0;
@@ -1459,17 +1715,8 @@ static int block_patch(CFS *c, InodeEntry *e, uint32_t b, const uint8_t *src,
 static int block_hole_pack(CFS *c, const uint8_t *seg, size_t len,
                            uint8_t **out, size_t *outcl) {
     if (c->flags & CFS_RAW) {
-        *outcl = CPENC_HEADER_SIZE + 1 + len;
-        uint8_t *d = malloc(*outcl);
-        if (!d) return -1;
-        CPEncHeader *h = (CPEncHeader*)d;
-        memset(h, 0, CPENC_HEADER_SIZE);
-        h->magic = CPENC_MAGIC; h->version = CPENC_VERSION;
-        h->stride = CPENC_STRIDE_RAW;
-        h->original_size = (uint32_t)len; h->compressed_size = (uint32_t)(1 + len);
-        d[CPENC_HEADER_SIZE] = CPENC_LAG_NONE;
-        memcpy(d + CPENC_HEADER_SIZE + 1, seg, len);
-        *out = d; return 0;
+        *out = raw_block_build(seg, len, outcl);
+        return *out ? 0 : -1;
     }
     size_t mc = cpenc_max_compressed_size(len);
     uint8_t *d = malloc(mc);
@@ -1747,7 +1994,7 @@ static int cfs_block_write_impl(CFS *c, const void *buf, size_t size, off_t offs
     {
         uint64_t tot = 0;
         for (int i = 0; i < np; i++) tot += pend_cl[i];
-        if (cfs_phys_room(c, (off_t)c->sb.inode_offset, (size_t)tot)) {
+        if (cfs_phys_room(c, (off_t)c->append_off, (size_t)tot)) {
             for (int i = 0; i < np; i++) free(pend_data[i]);
             return CFS_ENOSPC;
         }
@@ -1760,7 +2007,7 @@ static int cfs_block_write_impl(CFS *c, const void *buf, size_t size, off_t offs
     /* Unified append pass: grown patches + new blocks, written at the
      * old inode-table position, cursor advancing. */
     {
-        uint64_t app = c->sb.inode_offset;
+        uint64_t app = c->append_off;
         int hi = 0;
         for (int i = 0; i < np; i++) {
             if (cfs_pw(c, pend_data[i], pend_cl[i], (off_t)app) != (ssize_t)pend_cl[i]) {
@@ -1796,8 +2043,7 @@ static int cfs_block_write_impl(CFS *c, const void *buf, size_t size, off_t offs
          * through this cursor before it writes the inode table, and a cursor
          * left at the old table position would put them on top of the block
          * that was just appended here. */
-        c->sb.inode_offset = app;
-        c->sb.inode_size = 0;
+        c->append_off = app;
     }
 
     uint64_t want = prev_sz > minsz ? prev_sz : minsz;
@@ -2075,12 +2321,12 @@ static int store_append(CFS *c, const uint8_t *buf, size_t len, uint64_t *out_of
     {
         uint64_t tot = 0;
         for (uint32_t i = 0; i < nb; i++) tot += cl[i];
-        if (cfs_phys_room(c, (off_t)c->sb.inode_offset, (size_t)tot)) {
+        if (cfs_phys_room(c, (off_t)c->append_off, (size_t)tot)) {
             free_pieces(data, cl, ol, nb, 0); return CFS_ENOSPC;
         }
     }
     if (inode_grow_blocks(e, old + nb) != 0) { free_pieces(data, cl, ol, nb, 0); return -1; }
-    uint64_t off = c->sb.inode_offset;
+    uint64_t off = c->append_off;
     for (uint32_t i = 0; i < nb; i++) {
         if (cfs_pw(c, data[i], cl[i], (off_t)off) != (ssize_t)cl[i]) {
             /* Roll the reserved slots back: their bytes never landed, so the
@@ -2100,10 +2346,8 @@ static int store_append(CFS *c, const uint8_t *buf, size_t len, uint64_t *out_of
     e->raw.mtime = (uint64_t)time(NULL);
     /* Advance the append cursor past these blocks.  cfs_sync() below flushes
      * other writers (a dirty reference table) through the same cursor, and
-     * without this they would land on top of what was just written.  The
-     * recorded table size is stale until that sync rewrites it. */
-    c->sb.inode_offset = off;
-    c->sb.inode_size = 0;
+     * without this they would land on top of what was just written. */
+    c->append_off = off;
     return cfs_sync(c);
 }
 
@@ -2130,13 +2374,13 @@ static int dedup_write_table(CFS *c, InodeEntry *e, const CfsDedupTable *t) {
     {
         uint64_t tot = 0;
         for (uint32_t i = 0; i < nb; i++) tot += cl[i];
-        if (cfs_phys_room(c, (off_t)c->sb.inode_offset, (size_t)tot)) {
+        if (cfs_phys_room(c, (off_t)c->append_off, (size_t)tot)) {
             free_pieces(data, cl, ol, nb, 0); return CFS_ENOSPC;
         }
     }
     inode_clear_blocks(e);
     if (inode_grow_blocks(e, nb) != 0) { free_pieces(data, cl, ol, nb, 0); return -1; }
-    uint64_t off = c->sb.inode_offset;
+    uint64_t off = c->append_off;
     for (uint32_t i = 0; i < nb; i++) {
         if (cfs_pw(c, data[i], cl[i], (off_t)off) != (ssize_t)cl[i]) {
             free_pieces(data, cl, ol, nb, i); return -1;
@@ -2156,8 +2400,7 @@ static int dedup_write_table(CFS *c, InodeEntry *e, const CfsDedupTable *t) {
      * table out from under a read or write that is midway through it. */
     if (c->dt_path && strcmp(c->dt_path, e->path) != 0) dedup_cache_drop(c);
     /* Reserve the bytes for the next writer (see store_append). */
-    c->sb.inode_offset = off;
-    c->sb.inode_size = 0;
+    c->append_off = off;
     return 0;
 }
 
@@ -2368,7 +2611,7 @@ static int dedup_emit(CFS *c, const uint8_t *p, size_t n, uint64_t *out_off) {
      * buffer will occupy once appended (the append cursor plus everything
      * buffered), charging raw bytes where the append will charge compressed
      * ones: conservative, which is the right direction for a safety limit. */
-    if (cfs_phys_room(c, (off_t)c->sb.inode_offset, c->pend_n + n) != 0) return -1;
+    if (cfs_phys_room(c, (off_t)c->append_off, c->pend_n + n) != 0) return -1;
     /* Grow the staging buffer instead of flushing as soon as it fills, up to
      * one block: that keeps the store's compression context intact across
      * many small misses.  Beyond the cap the buffer is flushed and the chunk
@@ -2518,7 +2761,7 @@ ssize_t cfs_dedup_write(CFS *c, const char *path, const void *vbuf, size_t size,
      * would leave the earlier chunks referenced but never stored — the file
      * stops resolving.  Charging the raw size where the append will charge
      * the compressed size is conservative, which is the right direction. */
-    if (cfs_phys_room(c, (off_t)c->sb.inode_offset, c->pend_n + size) != 0) return -1;
+    if (cfs_phys_room(c, (off_t)c->append_off, c->pend_n + size) != 0) return -1;
 
     /* And a snapshot, for everything that is not the quota: an I/O failure
      * part-way through has the same shape. */
@@ -2750,8 +2993,7 @@ static uint64_t range_total(const Ranges *r) {
 
 /* Split a pending-byte cursor advance so the next writer does not reuse it. */
 static void dedup_cursor_reserve(CFS *c, uint64_t off) {
-    c->sb.inode_offset = off;
-    c->sb.inode_size = 0;
+    c->append_off = off;
 }
 
 int cfs_dedup_gc(CFS *c, CfsDedupGcStats *out) {
@@ -2856,15 +3098,15 @@ int cfs_dedup_gc(CFS *c, CfsDedupGcStats *out) {
             uint8_t *comp = NULL; size_t cl = 0;
             if (block_hole_pack(c, buf, want, &comp, &cl) != 0) { rc = -1; break; }
             uint32_t old = te->raw.block_count;
-            if (cfs_phys_room(c, (off_t)c->sb.inode_offset, cl)) { free(comp); rc = CFS_ENOSPC; break; }
+            if (cfs_phys_room(c, (off_t)c->append_off, cl)) { free(comp); rc = CFS_ENOSPC; break; }
             if (inode_grow_blocks(te, old + nb) != 0) { free(comp); rc = -1; break; }
-            if (cfs_pw(c, comp, cl, (off_t)c->sb.inode_offset) != (ssize_t)cl) {
+            if (cfs_pw(c, comp, cl, (off_t)c->append_off) != (ssize_t)cl) {
                 free(comp); rc = -1; break;
             }
-            te->raw.blocks[old].offset = c->sb.inode_offset;
+            te->raw.blocks[old].offset = c->append_off;
             te->raw.blocks[old].comp_size = (uint32_t)cl;
             te->raw.blocks[old].orig_size = (uint32_t)want;
-            dedup_cursor_reserve(c, c->sb.inode_offset + cl);
+            dedup_cursor_reserve(c, c->append_off + cl);
             te->raw.orig_size += want;
             free(comp);
             off += want;
