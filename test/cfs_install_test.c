@@ -185,6 +185,39 @@ int main(void) {
         unlink("/tmp/inst_c.cfs");
     }
 
+    /* case D: a disk whose block table reaches past the old sentinel.
+     *
+     * The write path marks a pending entry as "this is a new block" with a
+     * sentinel stored in the same array as block indices, and that sentinel
+     * was PEND_MAX == 128 — an ordinary block index.  A container with more
+     * than 128 blocks (1GB at the 8MB block chunk) therefore misread a patch
+     * of block 128 as an append and wrote one entry past the table, which
+     * `cfs-tool mkfs ext4 1200M` turned into a segfault.  Nothing here is a
+     * large amount of data: the container is written sparse, the blocks are
+     * zero runs, and the check is that the disk is still a disk afterwards. */
+    {
+        unlink("/tmp/inst_d.cfs");
+        CFS *c = cfs_create("/tmp/inst_d.cfs");
+        CHECK(c != NULL, "open D");
+        if (c) {
+            int rc = cfs_mkfs_ext4(c, 1200ULL * 1024 * 1024);
+            CHECK(rc == 0, "D: mkfs ext4 1200M (rc=%d)", rc);
+            cfs_close(c);
+
+            c = cfs_open("/tmp/inst_d.cfs", CFS_RDONLY);
+            CHECK(c != NULL, "D: reopen");
+            if (c) {
+                uint8_t sb[64];
+                ssize_t n = cfs_block_read(c, sb, sizeof sb, 1024 + 56);
+                CHECK(n == (ssize_t)sizeof sb, "D: read superblock (n=%zd)", n);
+                CHECK(n == (ssize_t)sizeof sb && sb[0] == 0x53 && sb[1] == 0xEF,
+                      "D: ext4 magic (got %02x%02x)", sb[0], sb[1]);
+                cfs_close(c);
+            }
+            unlink("/tmp/inst_d.cfs");
+        }
+    }
+
     printf(failures ? "=== %d FAILURES ===\n" : "=== 0 failures ===\n", failures);
     return failures ? 1 : 0;
 }

@@ -1231,6 +1231,12 @@ ssize_t cfs_block_read(CFS *c, void *buf, size_t size, off_t offset) {
 
 #define BLOCK_CHUNK (8u << 20)   /* 8MB compression unit: bounds RMW cost */
 #define PEND_MAX 128              /* pending-patch slots per write (<=2 touched) */
+/* Sentinel for "this pending entry is a new block, not a patch".
+ * It used to be PEND_MAX, which is also a perfectly ordinary block index: once
+ * a container held 129 blocks (1GB at 8MB a block), patching block 128 was read
+ * back as "new block" and the append pass wrote one entry past the table
+ * (found by `cfs-tool mkfs ext4 1200M`, a heap overflow of 8 bytes). */
+#define PEND_NEW ((uint32_t)-1)
 
 /* ── Block-write path: block-granular patching ───────────────────
  * Random writes touch only the blocks they overlap (decompress →
@@ -1519,7 +1525,7 @@ static int cfs_block_write_impl(CFS *c, const void *buf, size_t size, off_t offs
     uint64_t w0 = (uint64_t)offset, w1 = minsz;
 
     uint8_t   *pend_data[PEND_MAX];
-    uint32_t   pend_idx[PEND_MAX];   /* block idx, or PEND_MAX = new block */
+    uint32_t   pend_idx[PEND_MAX];   /* block idx, or PEND_NEW = new block */
     size_t     pend_cl[PEND_MAX];
     size_t     pend_orig[PEND_MAX];  /* orig size of new blocks */
     int        np = 0;
@@ -1572,7 +1578,7 @@ static int cfs_block_write_impl(CFS *c, const void *buf, size_t size, off_t offs
                 int rc = block_hole_pack(c, b2, size, &pend_data[np], &pend_cl[np]);
                 free(b2);
                 if (rc != 0) goto fail_pend;
-                pend_idx[np] = PEND_MAX;
+                pend_idx[np] = PEND_NEW;
                 pend_orig[np] = size;
                 np++; nnew++;
             } else if (block_patch(c, e, nb - 1, src, w0, cur_end, cur_end, size,
@@ -1587,7 +1593,7 @@ static int cfs_block_write_impl(CFS *c, const void *buf, size_t size, off_t offs
             int rc = block_hole_pack(c, b2, plen + size, &pend_data[np], &pend_cl[np]);
             free(b2);
             if (rc != 0) goto fail_pend;
-            pend_idx[np] = PEND_MAX;
+            pend_idx[np] = PEND_NEW;
             pend_orig[np] = plen + size;
             np++; nnew++;
         }
@@ -1654,7 +1660,14 @@ static int cfs_block_write_impl(CFS *c, const void *buf, size_t size, off_t offs
                 return -1;
             }
             free(pend_data[i]);
-            if (pend_idx[i] == PEND_MAX) {
+            if (pend_idx[i] == PEND_NEW) {
+                /* The grow above reserved exactly nnew slots; if that ever
+                 * disagrees with the number of new-block entries, writing
+                 * here would run past the table, so refuse instead. */
+                if (nb + (uint32_t)hi >= e->raw.block_count) {
+                    for (int j = i; j < np; j++) free(pend_data[j]);
+                    return -1;
+                }
                 CfsBlock *blk = &e->raw.blocks[nb + hi];
                 memset(blk, 0, sizeof(*blk));
                 blk->offset = app; blk->comp_size = (uint32_t)pend_cl[i];
