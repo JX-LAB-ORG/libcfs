@@ -12,6 +12,18 @@
 
 typedef struct { char *path; CfsInode raw; } InodeEntry;
 
+/* Shared count of open flash handles.  It lives outside the CFS struct so a
+ * flash handle can be closed after cfs_close() without touching freed
+ * memory: cfs_close frees it when no handle remains, otherwise the last
+ * handle does.  (The container lock still ends at cfs_close, which is why a
+ * handle is only a reader once its CFS handle is gone.) */
+typedef struct { int n; int orphan; } CfsFlashRef;
+
+/* Commit the in-memory inode table (data → table → non-live slot → fsync).
+ * Internal, but cfs_flash.c creates its entry directly and must use the same
+ * commit path as every other writer. */
+int cfs_sync(CFS *c);
+
 struct CFS {
     int           fd;
     int           flags;
@@ -83,6 +95,18 @@ struct CFS {
     /* Set when this handle holds the container's advisory lock (see
      * cfs_lock in cfs.c).  Released on close. */
     int           locked;
+
+    /* Set by cfs_sync() once the non-live superblock slot has been written.
+     * A failure after that point (fsync) means the container still describes
+     * the new state; callers that would otherwise roll back in memory use
+     * this to avoid making the handle disagree with the file. */
+    int           last_commit_landed;
+
+    /* Open CfsFlash handles on this container.  cfs_compact() refuses while
+     * any is open: compaction replaces the file and moves every extent, and
+     * a handle's dup'd fd (and any mmap) would keep pointing at the old
+     * inode, so later writes would land where nothing reads them. */
+    CfsFlashRef  *flash_ref;
 
     /* Bulk-write mode (cfs_set_batch): hold the pending @store bytes and the
      * inode table in memory across writes, so a multi-file import compresses

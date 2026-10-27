@@ -142,6 +142,62 @@ Partition table editing, when you need it:
 
 Types: `linux fat32 fat16 efi swap ntfs 0xNN`.
 
+### A flash medium: stored raw, executed in place
+
+`@block` is a compressed *disk image*. A flash medium is the other kind of
+storage: `@flash.<tag>` is a real flash device held as one contiguous,
+uncompressed range of the container file, so a program can execute from it
+without a copy.
+
+```sh
+./cfs-tool flash init fw.cfs uefi --type nor --size 16M --xip
+./cfs-tool flash info fw.cfs uefi
+./cfs-tool flash write fw.cfs uefi firmware.bin --erase --verify
+./cfs-tool flash read fw.cfs uefi out.bin
+./cfs-tool flash erase fw.cfs uefi
+./cfs-tool flash bad fw.cfs uefi --list
+./cfs-tool flash bad fw.cfs uefi --mark 12     # record a bad erase block
+```
+
+Rules the medium enforces (they are what makes it a flash device and not a
+file):
+
+- `erase` works on whole erase blocks and fills them with `0xFF`;
+- `write` may only clear bits (1 → 0), may not cross a program page, and is
+  refused unless the target bytes are erased — no read-modify-write masks;
+- a violation returns an error; nothing is silently truncated or rounded.
+
+Profiles and their defaults (`--page`, `--erase`, `--sector` override them):
+
+| `--type` | sector | page | erase | use |
+|---|---|---|---|---|
+| `nor` | 512 | 256 | 4 KiB | SPI NOR: firmware volume, variables |
+| `nand` | 512 | 2048 | 128 KiB | raw NAND (no OOB/ECC) |
+| `mcu` | 512 | 1024 | 4 KiB | Cortex-M internal flash |
+| `emmc` | 512 | 512 | 512 KiB | managed (reserved; not creatable yet) |
+
+`--size` is what the guest sees; the 4 KiB descriptor after the medium is
+not part of it. Creating a medium writes its whole size to disk — a 1 GB
+medium costs 1 GB of host space, and that is deliberate: XIP needs real
+bytes, not a sparse hole that reads as zero.
+
+**XIP.** The medium's first byte is page-aligned in the container file, so a
+consumer can map it directly:
+
+```sh
+cfs_flash_extent(f, &fd, &file_off, &len);
+mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, file_off);
+```
+
+`cfs_flash_map()` does the same mapping for callers that do not need to
+choose the address.
+
+**Compaction.** A medium created with `--xip` promises that its extent never
+moves (a consumer may be holding that mapping), so `cfs-tool compact` refuses
+such a container with `EOPNOTSUPP`. Without `--xip` the medium is just an
+image inside a container: `compact` copies it verbatim and updates its
+offset.
+
 ---
 
 ## 5. Four ways to reach the data
@@ -260,6 +316,7 @@ table are never refused, so "full" means full, not broken.
 | `CFS_BLOCK_PARTS` | block hook | `1` exposes `/dev/vdaN` partitions |
 | `CFS_SECTOR_SIZE` | block hook | `512` (default) or `4096` |
 | `CFS_RAW` | `cfs-fuse` | serve a container uncompressed |
+| `CFS_FLASH_SYNC` | `cfs_flash_*` | `each` fsyncs after every program/erase (power-loss tests) |
 | `CFS_PDBG` | file hook | print hook diagnostics to stderr |
 
 ---

@@ -1,4 +1,4 @@
-.PHONY: test testall clean fuzz
+.PHONY: test testall clean fuzz test-flash
 
 # Target-specific ISA flags: NEON on aarch64, a conservative x86-64 baseline
 # elsewhere (the NEON paths are compiled out there).  Override with ARCHFLAGS=.
@@ -10,7 +10,7 @@ ARCHFLAGS ?= -march=x86-64-v2
 endif
 CFLAGS = -std=gnu11 -fPIC -Wall -O3 $(ARCHFLAGS) -I. -I..
 
-OBJS = cfs.o cfs_part.o cfs_dedup.o cfs_verify.o cfs_mkfs_ext4.o cfs_mkfs_fat32.o cfs_mkfs_exfat.o cfs_ext4_install.o cfs_iso9660.o
+OBJS = cfs.o cfs_flash.o cfs_part.o cfs_dedup.o cfs_verify.o cfs_mkfs_ext4.o cfs_mkfs_fat32.o cfs_mkfs_exfat.o cfs_ext4_install.o cfs_iso9660.o
 CPENC = ../libcpool/cpenc.o ../libcpool/bwt.o
 
 # cfs_preload.so is what `cfs-tool mount` and the documented file-hook path
@@ -18,8 +18,14 @@ CPENC = ../libcpool/cpenc.o ../libcpool/bwt.o
 # meant the README's first example failed on a clean checkout.
 all: $(OBJS) cfs-tool cfs_preload.so cfs_block_hook.so
 
-cfs.o: cfs.c cfs_internal.h cfs.h cfs_format.h ../libcpool/cpenc.h
+cfs.o: cfs.c cfs_internal.h cfs.h cfs_format.h cfs_flash.h ../libcpool/cpenc.h
 	cc $(CFLAGS) -c cfs.c -o cfs.o
+
+# Flash media: a raw extent in the container plus its two-copy descriptor.
+# cfs.c calls into it (compact's XIP refusal, inode validation), so every
+# binary that links cfs.o links this too.
+cfs_flash.o: cfs_flash.c cfs_flash.h cfs_internal.h cfs_format.h cfs.h
+	cc $(CFLAGS) -c cfs_flash.c -o cfs_flash.o
 
 cfs_part.o: cfs_part.c cfs_part.h cfs_internal.h cfs_format.h
 	cc $(CFLAGS) -c cfs_part.c -o cfs_part.o
@@ -67,14 +73,14 @@ test/ext2_read.o: test/ext2_read.c
 cfs_path.o: cfs_path.c cfs_path.h
 	cc $(CFLAGS) -c cfs_path.c -o cfs_path.o
 
-cfs_preload.so: cfs_preload.c cfs_path.o cfs.o cfs_dedup.o ../libcpool/cpenc.o ../libcpool/bwt.o
-	cc $(CFLAGS) -fPIC cfs_preload.c cfs_path.o cfs.o cfs_dedup.o ../libcpool/cpenc.o ../libcpool/bwt.o -shared -ldl -lm -o cfs_preload.so
+cfs_preload.so: cfs_preload.c cfs_path.o cfs.o cfs_flash.o cfs_dedup.o ../libcpool/cpenc.o ../libcpool/bwt.o
+	cc $(CFLAGS) -fPIC cfs_preload.c cfs_path.o cfs.o cfs_flash.o cfs_dedup.o ../libcpool/cpenc.o ../libcpool/bwt.o -shared -ldl -lm -o cfs_preload.so
 
-cfs-tool: cfs-tool.c cfs.o cfs_part.o cfs_dedup.o cfs_verify.o cfs_mkfs_fat32.o cfs_mkfs_exfat.o cfs_mkfs_ext4.c cfs_mkfs_swap.c cfs_ext4_install.o cfs_iso9660.o ../libcpool/cpenc.o ../libcpool/bwt.o
-	cc $(CFLAGS) cfs-tool.c cfs.o cfs_part.o cfs_dedup.o cfs_verify.o cfs_mkfs_fat32.o cfs_mkfs_exfat.o cfs_mkfs_ext4.c cfs_mkfs_swap.c cfs_ext4_install.o cfs_iso9660.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o cfs-tool
+cfs-tool: cfs-tool.c cfs.o cfs_flash.o cfs_part.o cfs_dedup.o cfs_verify.o cfs_mkfs_fat32.o cfs_mkfs_exfat.o cfs_mkfs_ext4.c cfs_mkfs_swap.c cfs_ext4_install.o cfs_iso9660.o ../libcpool/cpenc.o ../libcpool/bwt.o
+	cc $(CFLAGS) cfs-tool.c cfs.o cfs_flash.o cfs_part.o cfs_dedup.o cfs_verify.o cfs_mkfs_fat32.o cfs_mkfs_exfat.o cfs_mkfs_ext4.c cfs_mkfs_swap.c cfs_ext4_install.o cfs_iso9660.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o cfs-tool
 
-cfs_block_hook.so: cfs_block_hook.c cfs.o cfs_part.o cfs_dedup.o ../libcpool/cpenc.o ../libcpool/bwt.o
-	cc $(CFLAGS) -fPIC cfs_block_hook.c cfs.o cfs_part.o cfs_dedup.o ../libcpool/cpenc.o ../libcpool/bwt.o -shared -ldl -lm -o cfs_block_hook.so
+cfs_block_hook.so: cfs_block_hook.c cfs.o cfs_flash.o cfs_part.o cfs_dedup.o ../libcpool/cpenc.o ../libcpool/bwt.o
+	cc $(CFLAGS) -fPIC cfs_block_hook.c cfs.o cfs_flash.o cfs_part.o cfs_dedup.o ../libcpool/cpenc.o ../libcpool/bwt.o -shared -ldl -lm -o cfs_block_hook.so
 
 # The seal test needs OpenSSL headers *and* a linkable libcrypto.  The Debian
 # test boxes have both; the phone (PRoot/Alpine, no libssl-dev) has neither,
@@ -86,49 +92,49 @@ HAS_OPENSSL := $(shell printf '#include <openssl/evp.h>\nint main(void){return 0
 HAS_FUSE := $(shell pkg-config --exists fuse3 2>/dev/null && echo yes)
 ifeq ($(HAS_FUSE),yes)
 all: cfs-fuse
-cfs-fuse: cfs-fuse.c cfs.o cfs_part.o cfs_dedup.o ../libcpool/cpenc.o ../libcpool/bwt.o
-	cc $(CFLAGS) $(shell pkg-config --cflags fuse3) cfs-fuse.c cfs.o cfs_part.o cfs_dedup.o ../libcpool/cpenc.o ../libcpool/bwt.o $(shell pkg-config --libs fuse3) -lm -o cfs-fuse
+cfs-fuse: cfs-fuse.c cfs.o cfs_flash.o cfs_part.o cfs_dedup.o ../libcpool/cpenc.o ../libcpool/bwt.o
+	cc $(CFLAGS) $(shell pkg-config --cflags fuse3) cfs-fuse.c cfs.o cfs_flash.o cfs_part.o cfs_dedup.o ../libcpool/cpenc.o ../libcpool/bwt.o $(shell pkg-config --libs fuse3) -lm -o cfs-fuse
 endif
 
 # Partition-layer regressions.  The block-hook case re-executes the test under
 # LD_PRELOAD and the mkfs/install cases drive cfs-tool, so both are built first.
-test/cfs_part_fix_test: test/cfs_part_fix_test.c cfs.o cfs_part.o cfs_dedup.o test/iso_mk.o ../libcpool/cpenc.o ../libcpool/bwt.o cfs-tool cfs_block_hook.so
-	cc $(CFLAGS) test/cfs_part_fix_test.c cfs.o cfs_part.o cfs_dedup.o test/iso_mk.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o test/cfs_part_fix_test
+test/cfs_part_fix_test: test/cfs_part_fix_test.c cfs.o cfs_flash.o cfs_part.o cfs_dedup.o test/iso_mk.o ../libcpool/cpenc.o ../libcpool/bwt.o cfs-tool cfs_block_hook.so
+	cc $(CFLAGS) test/cfs_part_fix_test.c cfs.o cfs_flash.o cfs_part.o cfs_dedup.o test/iso_mk.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o test/cfs_part_fix_test
 
 test: $(OBJS) $(CPENC) test/iso_mk.o test/ext2_read.o test/cfs_part_fix_test
-	cc $(CFLAGS) test/cfs_test.c cfs.o cfs_dedup.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o test/cfs_test
+	cc $(CFLAGS) test/cfs_test.c cfs.o cfs_flash.o cfs_dedup.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o test/cfs_test
 	./test/cfs_test
 	@echo "=== cfs_rw_test ==="
-	cc $(CFLAGS) test/cfs_rw_test.c cfs.o cfs_dedup.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o test/cfs_rw_test
+	cc $(CFLAGS) test/cfs_rw_test.c cfs.o cfs_flash.o cfs_dedup.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o test/cfs_rw_test
 	./test/cfs_rw_test
 	@echo "=== cfs_dir_test ==="
-	cc $(CFLAGS) test/cfs_dir_test.c cfs.o cfs_dedup.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o test/cfs_dir_test
+	cc $(CFLAGS) test/cfs_dir_test.c cfs.o cfs_flash.o cfs_dedup.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o test/cfs_dir_test
 	./test/cfs_dir_test
 	@echo "=== cfs_new_test ==="
-	cc $(CFLAGS) test/cfs_new_test.c cfs.o cfs_dedup.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o test/cfs_new_test
+	cc $(CFLAGS) test/cfs_new_test.c cfs.o cfs_flash.o cfs_dedup.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o test/cfs_new_test
 	./test/cfs_new_test
 	@echo "=== cfs_compact_test ==="
-	cc $(CFLAGS) test/cfs_compact_test.c cfs.o cfs_dedup.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o test/cfs_compact_test
+	cc $(CFLAGS) test/cfs_compact_test.c cfs.o cfs_flash.o cfs_dedup.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o test/cfs_compact_test
 	./test/cfs_compact_test
 	@echo "=== cfs_block_test ==="
-	cc $(CFLAGS) test/cfs_block_test.c cfs.o cfs_dedup.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o test/cfs_block_test
+	cc $(CFLAGS) test/cfs_block_test.c cfs.o cfs_flash.o cfs_dedup.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o test/cfs_block_test
 	./test/cfs_block_test
 	@echo "=== cfs_part_test ==="
-	cc $(CFLAGS) test/cfs_part_test.c cfs.o cfs_part.o cfs_dedup.o cfs_mkfs_ext4.c cfs_mkfs_fat32.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o test/cfs_part_test
+	cc $(CFLAGS) test/cfs_part_test.c cfs.o cfs_flash.o cfs_part.o cfs_dedup.o cfs_mkfs_ext4.c cfs_mkfs_fat32.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o test/cfs_part_test
 	./test/cfs_part_test
 	@echo "=== cfs_part_fix_test ==="
 	./test/cfs_part_fix_test
 	@echo "=== cfs_install_test ==="
-	cc $(CFLAGS) test/cfs_install_test.c cfs.o cfs_part.o cfs_dedup.o cfs_mkfs_ext4.o cfs_ext4_install.o cfs_iso9660.o test/iso_mk.o test/ext2_read.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o test/cfs_install_test
+	cc $(CFLAGS) test/cfs_install_test.c cfs.o cfs_flash.o cfs_part.o cfs_dedup.o cfs_mkfs_ext4.o cfs_ext4_install.o cfs_iso9660.o test/iso_mk.o test/ext2_read.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o test/cfs_install_test
 	./test/cfs_install_test
 	@echo "=== cfs_dedup_test ==="
-	cc $(CFLAGS) test/cfs_dedup_test.c cfs.o cfs_dedup.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o test/cfs_dedup_test
+	cc $(CFLAGS) test/cfs_dedup_test.c cfs.o cfs_flash.o cfs_dedup.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o test/cfs_dedup_test
 	./test/cfs_dedup_test
 	@echo "=== cfs_dedup_write_test ==="
-	cc $(CFLAGS) test/cfs_dedup_write_test.c cfs.o cfs_dedup.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o test/cfs_dedup_write_test
+	cc $(CFLAGS) test/cfs_dedup_write_test.c cfs.o cfs_flash.o cfs_dedup.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o test/cfs_dedup_write_test
 	./test/cfs_dedup_write_test
 	@echo "=== cfs_dedup_writepath_test ==="
-	cc $(CFLAGS) test/cfs_dedup_writepath_test.c cfs.o cfs_dedup.o cfs_verify.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o test/cfs_dedup_writepath_test
+	cc $(CFLAGS) test/cfs_dedup_writepath_test.c cfs.o cfs_flash.o cfs_dedup.o cfs_verify.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o test/cfs_dedup_writepath_test
 	./test/cfs_dedup_writepath_test
 	@echo "=== cfs_dedup_codec_test ==="
 	cc $(CFLAGS) test/cfs_dedup_codec_test.c cfs_dedup.c -o test/cfs_dedup_codec_test
@@ -137,13 +143,13 @@ test: $(OBJS) $(CPENC) test/iso_mk.o test/ext2_read.o test/cfs_part_fix_test
 	cc $(CFLAGS) test/cfs_path_test.c cfs_path.c -o test/cfs_path_test
 	./test/cfs_path_test
 	@echo "=== cfs_regress_test ==="
-	cc $(CFLAGS) test/cfs_regress_test.c cfs.o cfs_dedup.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o test/cfs_regress_test
+	cc $(CFLAGS) test/cfs_regress_test.c cfs.o cfs_flash.o cfs_dedup.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o test/cfs_regress_test
 	./test/cfs_regress_test
 	@echo "=== cfs_fixA_test ==="
-	cc $(CFLAGS) test/cfs_fixA_test.c cfs.o cfs_dedup.o cfs_verify.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o test/cfs_fixA_test
+	cc $(CFLAGS) test/cfs_fixA_test.c cfs.o cfs_flash.o cfs_dedup.o cfs_verify.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o test/cfs_fixA_test
 	./test/cfs_fixA_test
 	@echo "=== cfs_crash_test ==="
-	cc $(CFLAGS) test/cfs_crash_test.c cfs.o cfs_dedup.o cfs_verify.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o test/cfs_crash_test
+	cc $(CFLAGS) test/cfs_crash_test.c cfs.o cfs_flash.o cfs_dedup.o cfs_verify.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o test/cfs_crash_test
 	./test/cfs_crash_test
 ifeq ($(HAS_OPENSSL),yes)
 	@echo "=== cfs_seal_test ==="
@@ -152,6 +158,17 @@ ifeq ($(HAS_OPENSSL),yes)
 else
 	@echo "=== cfs_seal_test: skipped (no OpenSSL headers/libcrypto) ==="
 endif
+
+# Flash-medium regressions: creation/layout, the raw program rules, XIP,
+# compact's refusal, and the container-level file guards.  Built by `test-flash`
+# but deliberately not run from `test:` — the maintainer runs this suite on the
+# test host.  cfs_verify.o is needed for the verify case (D19); the medium
+# itself lives in cfs_flash.o.
+test/cfs_flash_test: test/cfs_flash_test.c cfs.o cfs_flash.o cfs_dedup.o cfs_verify.o ../libcpool/cpenc.o ../libcpool/bwt.o
+	cc $(CFLAGS) test/cfs_flash_test.c cfs.o cfs_flash.o cfs_dedup.o cfs_verify.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o test/cfs_flash_test
+
+test-flash: test/cfs_flash_test
+	@echo "built test/cfs_flash_test (not run)"
 
 # Container-level benchmark: sequential/random I/O, small files, compact.
 bench: test/bench_cfs test/bench_gen test/bench_tables
@@ -184,14 +201,14 @@ clean-bench:
 	rm -rf /root/bench/corpus /root/bench/plain.bin /root/bench/bench.cfs
 	rm -rf /tmp/benchtools.* /tmp/benchdedup.*
 
-test/bench_cfs: test/bench_cfs.c cfs.o cfs_dedup.o $(CPENC)
-	cc $(CFLAGS) test/bench_cfs.c cfs.o cfs_dedup.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o test/bench_cfs
+test/bench_cfs: test/bench_cfs.c cfs.o cfs_flash.o cfs_dedup.o $(CPENC)
+	cc $(CFLAGS) test/bench_cfs.c cfs.o cfs_flash.o cfs_dedup.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o test/bench_cfs
 
 # Deep stress tests (random writes, block-cap fallback, part loops).  The
 # "flaky under PRoot" note that used to live here was a bug in the test
 # itself (a 512-byte buffer written 1024 bytes wide), now fixed.
 stress: $(OBJS) $(CPENC)
-	cc $(CFLAGS) test/cfs_stress_test.c cfs.o cfs_part.o cfs_dedup.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o test/cfs_stress_test
+	cc $(CFLAGS) test/cfs_stress_test.c cfs.o cfs_flash.o cfs_part.o cfs_dedup.o ../libcpool/cpenc.o ../libcpool/bwt.o -lm -o test/cfs_stress_test
 	./test/cfs_stress_test
 
 testall: test cfs-tool cfs_preload.so cfs_block_hook.so
@@ -218,6 +235,7 @@ clean:
 	rm -f $(OBJS) cfs_seal.o cfs_preload.o cfs_preload.so cfs-tool cfs_block_hook.so cfs-fuse
 	rm -f test/iso_mk.o test/ext2_read.o test/vblk_probe test/iso_gen
 	rm -f test/cfs_regress_test test/cfs_fixA_test test/cfs_crash_test test/cfs_part_fix_test test/cfs_test test/cfs_rw_test test/cfs_dir_test test/cfs_new_test test/cfs_compact_test test/cfs_block_test test/cfs_part_test test/cfs_stress_test test/vblk_probe
+	rm -f test/cfs_flash_test
 	rm -f test/cfs_dedup_test test/cfs_dedup_write_test test/cfs_dedup_writepath_test test/cfs_dedup_codec_test
 	rm -f test/cfs_seal_test
 	rm -f test/bench_cfs test/fuzz_cfs

@@ -24,6 +24,15 @@
 - **`@block` virtual block device**: a reserved entry carrying a standard
   MBR/GPT partition table. Sparse (unwritten regions read as zero), and it
   declares its own drive identity (SSD / HDD / USB / SD) at creation time.
+- **`@flash.<tag>` flash media**: a second kind of medium, stored raw and
+  uncompressed so it can be executed in place. A medium is one contiguous,
+  page-aligned range of the container file — `[bytes][4 KiB descriptor]` —
+  and the API enforces real flash rules: erase fills 0xFF, a program may only
+  clear bits and may not cross a page, and a byte that is not erased must be
+  erased before it can be written. `cfs_flash_extent()` hands out the fd and
+  file offset, so a consumer can `mmap()` the medium into its own address
+  space (XIP). Media created with `--xip` make `cfs_compact` refuse the
+  container, because the extent's offset is part of the contract.
 - **Formatters, written from scratch**: ext4 / FAT32 / exFAT / swap. They write
   the on-disk structures directly — no external tools, no mounting. An ISO9660
   reader and an ext4 installer let you install a bootable root filesystem from
@@ -173,6 +182,7 @@ path the process resolves is real by the time the kernel sees it.
 | `unpack <cfs> <path> <out>` | extract one file |
 | `ls` / `cat` / `stat` / `mkdir` / `rm` / `mv` / `symlink` / `trunc` | ordinary file operations |
 | `mkfs <type> <size> <cfs> [-p n] [-g] [--disk ssd\|hdd\|usb\|sd]` | format |
+| `flash init\|info\|read\|write\|erase\|bad` | create and access a `@flash.<tag>` medium |
 | `disktype <cfs> [kind]` | query or set the drive identity |
 | `install <iso> <size> <cfs> [-p n] [-g]` | install ext4 from an ISO |
 | `partlabel` / `partadd` / `partdel` / `parttype` / `partlist` / `partwrite` | partition table |
@@ -223,6 +233,7 @@ are all documented in that header. An older reader meeting an unknown mode
 
 ```sh
 make test       # 13 suites
+make test-flash # builds the flash-medium suite (run it on a test host)
 make stress     # random writes / block-limit fallback / partition loops
 make testall    # test + cfs-tool smoke test + ext4/exfat fsck acceptance + block hook test
 make fuzz       # container fuzzing (needs clang + compiler-rt)
@@ -256,6 +267,9 @@ requires an external tool.
 ## Known limits
 
 - Device enumeration: the preload path cannot do it (see above).
+- A `@flash.*` medium is raw by design: no compression, no dedup, and — when
+  created with `--xip` — no compaction. Managed media (eMMC/SD, where an FTL
+  hides erase blocks) are reserved in the format but not creatable yet.
 - `verify` does not repair, and there is no interactive `fsck`-style repair
   flow. It checks structure and re-decodes, but it **cannot see silent
   corruption that decodes to different bytes** (the encoder once lowercasing

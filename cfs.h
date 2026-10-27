@@ -45,7 +45,7 @@ typedef struct {
 typedef struct {
     uint64_t size;
     uint64_t mtime;
-    uint16_t mode;     /* 0=file, 1=dir, 2=symlink, 3=dedup */
+    uint16_t mode;     /* 0=file, 1=dir, 2=symlink, 3=dedup, 4=flash */
     uint32_t block_count;
 } CfsStat;
 
@@ -262,6 +262,11 @@ void   cfs_stats(CFS *cfs, CfsStats *out);
  * could not be opened at all. */
 #define CFS_VERIFY_DEEP  0x01   /* decode every block and re-read every file */
 int    cfs_verify(const char *path, unsigned flags, FILE *out);
+
+/* ─── Flash media ──────────────────────────────────────────────
+ * A "@flash.<tag>" entry is a real flash medium, not a file; its API lives in
+ * cfs_flash.h.  Included last so this header owns the CFS typedef. */
+#include "cfs_flash.h"
 
 #ifdef __cplusplus
 }

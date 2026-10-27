@@ -162,8 +162,8 @@ static int blocks_overlap(CFS *c, uint64_t start, uint64_t end) {
     for (uint32_t i = 0; i < c->inode_count; i++)
         for (uint32_t b = 0; b < c->inodes[i].raw.block_count; b++) {
             const CfsBlock *bl = &c->inodes[i].raw.blocks[b];
-            if (bl->comp_size && bl->offset < end &&
-                start < bl->offset + (uint64_t)bl->comp_size)
+            uint64_t span = cfs_block_span(c->inodes[i].raw.mode, bl);
+            if (span && bl->offset < end && start < bl->offset + span)
                 return 1;
         }
     return 0;
@@ -209,10 +209,11 @@ static int upgrade_relocate(CFS *c) {
  * after the data, which is what makes a long series of metadata-only syncs
  * stop growing the file (the old code moved the table to the previous
  * table's end on every sync). */
-static int cfs_sync(CFS *c) {
+int cfs_sync(CFS *c) {
     volatile uint64_t canary_a = 0xCAFEBABECAFEBABEULL;
     volatile uint64_t canary_b = 0xDEADBEEFDEADBEEFULL;
     if (!c || !(c->flags & CFS_RDWR)) return -1;
+    c->last_commit_landed = 0;
 
     /* Merge layer: buffered store bytes and edited reference tables have to
      * reach disk before the inode table that points at them. */
@@ -255,6 +256,7 @@ static int cfs_sync(CFS *c) {
 
     /* Find physical end of last data block */
     uint64_t data_end = CFS_SB_SIZE;
+    int have_flash = 0;
     c->st.total_compressed_size = 0;
     c->st.total_orig_size = 0;
     c->st.file_count = 0;
@@ -267,16 +269,28 @@ static int cfs_sync(CFS *c) {
          * as its size.  @block is a device image, not user content, and stays
          * out. */
         int store = c->inodes[i].path && !strcmp(c->inodes[i].path, CFS_STORE_PATH);
+        if (c->inodes[i].raw.mode == CFS_MODE_FLASH) have_flash = 1;
         if (user) {
             c->st.total_orig_size += c->inodes[i].raw.orig_size;
             c->st.file_count++;
         }
         for (uint32_t b = 0; b < c->inodes[i].raw.block_count; b++) {
-            uint64_t be = c->inodes[i].raw.blocks[b].offset + c->inodes[i].raw.blocks[b].comp_size;
+            /* A flash extent occupies orig_size bytes of the file, not
+             * comp_size (which is 0, the raw marker).  Using comp_size here
+             * would let the next table land inside the medium as soon as the
+             * slot-reuse branch below picks a pre-medium region. */
+            uint64_t be = c->inodes[i].raw.blocks[b].offset +
+                          cfs_block_span(c->inodes[i].raw.mode,
+                                        &c->inodes[i].raw.blocks[b]);
             if (be > data_end) data_end = be;
             if (user || store) c->st.total_compressed_size += c->inodes[i].raw.blocks[b].comp_size;
         }
     }
+    /* A single sticky bit tells newer tools (and a human reading the
+     * superblock) that this container holds a flash medium.  Old readers
+     * ignore unknown flag bits, and the mode-4 entry is what actually makes
+     * them fail closed. */
+    if (have_flash) c->sb.flags |= CFS_SB_FLAG_FLASH;
     c->st.compress_ratio = c->st.total_compressed_size > 0
         ? (float)c->st.total_orig_size / (float)c->st.total_compressed_size : 1.0f;
     c->sb.file_count = c->inode_count;
@@ -328,6 +342,10 @@ static int cfs_sync(CFS *c) {
     uint32_t seq = c->sb_seq + 1;
     if (shield && sb_write_legacy(c, io, tsz) != 0) return -1;
     if (sb_commit(c, target, seq, io, tsz) != 0) return -1;
+    /* The target slot now points at a complete table: the container describes
+     * the new state from here on, even if the legacy re-seal or the fsync
+     * below fails.  Callers that would roll back in memory check this. */
+    c->last_commit_landed = 1;
     if (was_legacy) {
         /* Seal the primary as a v3 record too.  Its 44 bytes may reach into
          * [40,44), which upgrade_relocate() has already emptied. */
@@ -346,15 +364,17 @@ static int cfs_sync(CFS *c) {
 /* ── Create new container ────────────────────────────────── */
 CFS *cfs_create(const char *path) {
     CFS *c = calloc(1, sizeof(*c)); if(!c)return NULL;
+    c->flash_ref = calloc(1, sizeof *c->flash_ref);
+    if (!c->flash_ref) { free(c); return NULL; }
     c->fd = open(path, O_RDWR|O_CREAT|O_TRUNC, 0644);
-    if(c->fd < 0) { free(c); return NULL; }
+    if(c->fd < 0) { free(c->flash_ref); free(c); return NULL; }
     c->cpath = strdup(path);
-    if (!c->cpath) { close(c->fd); free(c); return NULL; }
+    if (!c->cpath) { close(c->fd); free(c->flash_ref); free(c); return NULL; }
     c->flags = CFS_RDWR;
     /* O_TRUNC has already cut the file down, so this is the last chance to
      * notice that someone else was using it — without the lock, "create"
      * silently destroys a container another handle is writing. */
-    if (cfs_lock(c) != 0) { errno = EBUSY; close(c->fd); free(c); return NULL; }
+    if (cfs_lock(c) != 0) { errno = EBUSY; close(c->fd); free(c->flash_ref); free(c); return NULL; }
     c->part_kind = -1;   /* partition cache starts unparsed */
     memcpy(c->sb.magic, CFS_MAGIC, 8);
     c->sb.version = CFS_VERSION;
@@ -367,7 +387,7 @@ CFS *cfs_create(const char *path) {
     c->sb_seq = 0;
     c->append_off = CFS_SB_REGION;
     /* Write initial superblock */
-    if (cfs_sync(c) != 0) { close(c->fd); free(c); return NULL; }
+    if (cfs_sync(c) != 0) { close(c->fd); free(c->flash_ref); free(c); return NULL; }
     return c;
 }
 
@@ -479,15 +499,17 @@ static int cfs_lock(CFS *c) {
 CFS *cfs_open(const char *path, int flags) {
     int oflags = (flags & CFS_RDWR) ? O_RDWR : O_RDONLY;
     CFS *c = calloc(1, sizeof(*c)); if (!c) return NULL;
+    c->flash_ref = calloc(1, sizeof *c->flash_ref);
+    if (!c->flash_ref) { free(c); return NULL; }
     c->part_kind = -1;   /* partition cache starts unparsed (calloc would give NONE) */
     c->flags = flags & (CFS_RDONLY | CFS_RDWR);
     c->fd = open(path, oflags);
-    if (c->fd < 0) { free(c); return NULL; }
+    if (c->fd < 0) { free(c->flash_ref); free(c); return NULL; }
     c->cpath = strdup(path);
-    if (!c->cpath) { close(c->fd); free(c); return NULL; }
+    if (!c->cpath) { close(c->fd); free(c->flash_ref); free(c); return NULL; }
     /* Lock before reading anything: a table read while another handle is
      * halfway through a sync is exactly the torn state this prevents. */
-    if (cfs_lock(c) != 0) { errno = EBUSY; close(c->fd); free(c); return NULL; }
+    if (cfs_lock(c) != 0) { errno = EBUSY; close(c->fd); free(c->flash_ref); free(c); return NULL; }
     /* Host policy, not container content: the physical quota is set by
      * whoever opens the container (the hook and the CLI both honour
      * CFS_MAX_PHYSICAL), so it never has to live in the format. */
@@ -593,6 +615,10 @@ CFS *cfs_open(const char *path, int flags) {
         e->raw.mode        = rd16(p); p += 2;
         e->raw.path_len    = rd16(p); p += 2;
         e->raw.block_count = rd32(p); p += 4;
+        if (e->raw.mode > CFS_MODE_FLASH) goto fail;
+        /* A medium is one extent; block_count 0 would skip the checks
+         * below and leave an entry cfs_flash_open() cannot use. */
+        if (e->raw.mode == CFS_MODE_FLASH && e->raw.block_count != 1) goto fail;
         if (e->raw.block_count > CFS_BLOCK_SANITY) goto fail;
         e->raw.blocks = calloc(e->raw.block_count ? e->raw.block_count : 1, sizeof(CfsBlock));
         if (!e->raw.blocks) goto fail;
@@ -610,6 +636,31 @@ CFS *cfs_open(const char *path, int flags) {
              * container that declared comp_size = 1.7GB still made
              * block_patch malloc it, which is the fifth time fuzzing found
              * the same shape in a new place. */
+            /* A flash entry is not a CPEnc stream: one contiguous raw range
+             * holding the medium plus its descriptor (see cfs_format.h).
+             * comp_size == 0 is the raw marker, so none of the codec checks
+             * below apply — but the range itself has to be inside the file,
+             * aligned, and consistent with the inode's declared size. */
+            if (e->raw.mode == CFS_MODE_FLASH) {
+                if (e->raw.block_count != 1 || bl->comp_size != 0) goto fail;
+                if (bl->orig_size < CFS_FLASH_DESC_SIZE ||
+                    bl->orig_size > CFS_FLASH_MAX + CFS_FLASH_DESC_SIZE) goto fail;
+                if ((bl->offset % CFS_FLASH_DESC_SIZE) != 0) goto fail;
+                /* The extent must not sit on the superblock slots: a guest
+                 * erase there would destroy both records. */
+                if (bl->offset < CFS_SB_REGION) goto fail;
+                /* Subtract rather than add: both fields are untrusted. */
+                if (bl->offset > (uint64_t)fsz ||
+                    bl->orig_size > (uint64_t)fsz - bl->offset) goto fail;
+                if (e->raw.orig_size != bl->orig_size) goto fail;
+                /* The extent is the high-water mark even though comp_size is
+                 * zero.  Missing this is not cosmetic: append_off would fall
+                 * back before the medium and the next write would land on
+                 * guest byte 0. */
+                if (bl->offset + (uint64_t)bl->orig_size > c->append_off)
+                    c->append_off = bl->offset + (uint64_t)bl->orig_size;
+                continue;
+            }
             if (bl->orig_size > CFS_BLOCK_MAX || bl->comp_size == 0) goto fail;
             if (bl->comp_size > cpenc_max_compressed_size(bl->orig_size)) goto fail;
             if ((uint64_t)bl->offset + bl->comp_size > (uint64_t)fsz) goto fail;
@@ -661,6 +712,36 @@ CFS *cfs_open(const char *path, int flags) {
         c->inode_count++;
     }
     free(it);
+
+    /* A flash extent is directly writable through its API (and through a
+     * guest's XIP mapping), so it must not sit on anything the container
+     * needs: one erase would turn the superblock, a slot table or the inode
+     * table into 0xFF, and cfs_flash_read would hand host metadata to the
+     * guest.  Reject such a table at open rather than let verify be the only
+     * place that notices. */
+    for (uint32_t i = 0; i < c->inode_count; i++) {
+        InodeEntry *fe = &c->inodes[i];
+        if (fe->raw.mode != CFS_MODE_FLASH) continue;
+        uint64_t fs = fe->raw.blocks[0].offset;
+        uint64_t fe_end = fs + (uint64_t)fe->raw.blocks[0].orig_size;
+        if (c->sb.inode_size &&
+            fs < (uint64_t)c->sb.inode_offset + c->sb.inode_size &&
+            (uint64_t)c->sb.inode_offset < fe_end) goto fail;
+        for (int sl = 0; sl < CFS_SB_SLOTS; sl++)
+            if (c->slot_valid[sl] && c->slot_size[sl] &&
+                fs < c->slot_off[sl] + c->slot_size[sl] &&
+                c->slot_off[sl] < fe_end) goto fail;
+        for (uint32_t j = 0; j < c->inode_count; j++) {
+            if (j == i) continue;
+            for (uint32_t b = 0; b < c->inodes[j].raw.block_count; b++) {
+                const CfsBlock *ob = &c->inodes[j].raw.blocks[b];
+                uint64_t os = ob->offset;
+                uint64_t oe = os + cfs_block_span(c->inodes[j].raw.mode, ob);
+                if (oe && fs < oe && os < fe_end) goto fail;
+            }
+        }
+    }
+
     c->st.compress_ratio = c->st.total_compressed_size > 0
         ? (float)c->st.total_orig_size / (float)c->st.total_compressed_size : 1.0f;
     return c;
@@ -680,7 +761,7 @@ fail:
         free(c->inodes);
     }
     free(c->cpath);
-    close(c->fd); free(c); return NULL;
+    close(c->fd); free(c->flash_ref); free(c); return NULL;
 }
 
 int cfs_lock_now(CFS *c) {
@@ -701,6 +782,10 @@ void cfs_close(CFS *c) {
     for (uint32_t i = 0; i < c->inode_count; i++) { free(c->inodes[i].path); free(c->inodes[i].raw.blocks); }
     free(c->inodes);
     free(c->cpath);
+    if (c->flash_ref) {
+        if (c->flash_ref->n == 0) free(c->flash_ref);
+        else c->flash_ref->orphan = 1;   /* the last flash handle frees it */
+    }
     free(c);
 }
 
@@ -819,6 +904,10 @@ int cfs_write(CFS *c, const char *path, const void *buf, size_t size) {
     if (size == 0) {
         /* Touch: create or clear to 0 bytes */
         InodeEntry *e = lu(c, path);
+        /* A flash medium is not a file.  The touch path used to reset any
+         * existing entry to mode FILE; doing that to a medium would orphan
+         * its range and leave a bogus empty file where the device was. */
+        if (e && e->raw.mode == CFS_MODE_FLASH) { errno = EINVAL; return -1; }
         if (!e) {
             InodeEntry *na = realloc(c->inodes, (c->inode_count + 1) * sizeof(InodeEntry));
             if (!na) return -1;
@@ -848,6 +937,9 @@ int cfs_write(CFS *c, const char *path, const void *buf, size_t size) {
         return cfs_write_dedup(c, path, buf, size);
 
     InodeEntry *e = lu(c, path);
+    /* Replacing a medium's content with a file would silently discard the
+     * device; the flash API is the only writer. */
+    if (e && e->raw.mode == CFS_MODE_FLASH) { errno = EINVAL; return -1; }
     int is_new = (e == NULL);
     uint32_t n_blocks = (uint32_t)((size + CFS_BLOCK_SPLIT - 1) / CFS_BLOCK_SPLIT);
     if (n_blocks > CFS_BLOCK_SANITY) return -2;
@@ -1039,6 +1131,14 @@ int cfs_unlink(CFS *c, const char *path) {
                     }
                 }
             }
+            /* A medium is a device, not a file: removing the entry would
+             * orphan its whole extent (compact cannot reclaim it while an
+             * XIP medium pins the container).  The CLI refuses as well; the
+             * guard lives here so library callers get the same answer. */
+            if (c->inodes[i].raw.mode == CFS_MODE_FLASH) {
+                errno = EINVAL;
+                return -1;
+            }
             /* The table cache is keyed by path.  If it still names this path,
              * drop it: the entry is going away, so its edits (dirty or not)
              * are irrelevant — and a later entry created under the same name
@@ -1081,6 +1181,15 @@ int cfs_truncate(CFS *c, const char *path, uint64_t size) {
     InodeEntry *e = lu(c, path);
     if (!e) return -1;
 
+    /* Only a file and a reference table have a truncatable length.  DIR,
+     * SYMLINK and FLASH must fail even when the requested size happens to
+     * equal the entry's size: the old early return below reported success
+     * for those, and for a medium that "success" looked like a truncate. */
+    if (e->raw.mode != CFS_MODE_FILE && e->raw.mode != CFS_MODE_DEDUP) {
+        errno = EINVAL;
+        return -1;
+    }
+
     if (size == e->raw.orig_size) return 0;
 
     /* A reference table is trimmed in place: refs past the new end are
@@ -1105,7 +1214,7 @@ int cfs_truncate(CFS *c, const char *path, uint64_t size) {
         return cfs_sync(c);
     }
 
-    if (e->raw.mode != CFS_MODE_FILE) return -1;
+    if (e->raw.mode != CFS_MODE_FILE) { errno = EINVAL; return -1; }
 
     if (size == 0) {
         e->raw.orig_size   = 0;
@@ -1253,6 +1362,10 @@ int cfs_rename(CFS *c, const char *oldpath, const char *newpath) {
     InodeEntry *e = lu(c, oldpath);
     if (!e) { errno = ENOENT; return -1; }
     if (lu(c, newpath)) { errno = EEXIST; return -1; }
+    /* The "@flash." prefix and the tag are what cfs_flash_open() resolves;
+     * renaming the entry (or a file onto it) would leave a medium that no
+     * longer answers to its tag. */
+    if (e->raw.mode == CFS_MODE_FLASH) { errno = EINVAL; return -1; }
 
     /* Pending reference-table edits are found by the path the cache was
      * loaded under.  Renaming first would make dedup_table_flush() look the
@@ -1319,6 +1432,22 @@ int cfs_utimens(CFS *c, const char *path, uint64_t atime, uint64_t mtime) {
 int cfs_compact(CFS *c) {
     if (!c || !(c->flags & CFS_RDWR)) return -1;
 
+    /* A medium created with F_XIP promises its extent never moves: a consumer
+     * may hold a mapping of it, and the extent's file offset is part of the
+     * contract.  Compacting rebuilds the whole file at new offsets, so any
+     * such medium forbids the pass.  (A medium without the flag is an image
+     * sitting in an ordinary container and is copied verbatim below.) */
+    if (cfs_flash_any_xip(c)) { errno = EOPNOTSUPP; return -1; }
+    /* A live flash handle owns a dup of the old fd and a snapshot of the
+     * extent offset.  Compaction renames a new file into place, so those
+     * would silently point at the unlinked inode: writes would "succeed"
+     * and then be invisible.  Refuse instead. */
+    if (c->flash_ref && c->flash_ref->n) { errno = EBUSY; return -1; }
+    /* A previous compact may have lost the lock to a racing opener;
+     * rewriting the file without it is exactly what the lock exists
+     * to prevent. */
+    if (!c->locked && cfs_lock(c) != 0) { errno = EBUSY; return -1; }
+
     /* The copy below reads blocks back through the file descriptor, so a
      * bulk-mode handle that still holds store bytes or an unwritten table in
      * memory has to land them first. */
@@ -1345,32 +1474,66 @@ int cfs_compact(CFS *c) {
     if (tfd < 0) return -1;
 
     /* Walk inodes, copy active blocks to temp file.  The rebuilt container
-     * uses the v3 layout: the slot region is reserved, data starts after it. */
+     * uses the v3 layout: the slot region is reserved, data starts after it.
+     *
+     * New offsets go into a side array and are published only after the
+     * rename succeeds.  Rewriting them in place meant any failure in this
+     * pass left the live inode table pointing into the temporary file, which
+     * is then unlinked — later reads would take bytes from the wrong file. */
     uint64_t cur_off = CFS_SB_REGION;
-    /* Inodes will be rebuilt with new offsets */
+    size_t total_blocks = 0;
+    for (uint32_t i = 0; i < c->inode_count; i++)
+        total_blocks += c->inodes[i].raw.block_count;
+    uint64_t *new_off = malloc((total_blocks ? total_blocks : 1) * sizeof(uint64_t));
+    if (!new_off) { close(tfd); unlink(tmp); return -1; }
+    size_t k = 0;
     for (uint32_t i = 0; i < c->inode_count; i++) {
         InodeEntry *e = &c->inodes[i];
-        if (!e->path) continue;
-        if (e->raw.block_count == 0 || e->raw.mode == CFS_MODE_DIR) continue;
-
+        int copyable = e->path && e->raw.mode != CFS_MODE_DIR;
         for (uint32_t b = 0; b < e->raw.block_count; b++) {
-            if (e->raw.blocks[b].comp_size == 0) continue;
-            uint8_t *blk = malloc(e->raw.blocks[b].comp_size);
-            if (!blk) { close(tfd); unlink(tmp); return -1; }
-            if (pread(c->fd, blk, e->raw.blocks[b].comp_size,
-                      (off_t)e->raw.blocks[b].offset) !=
-                (ssize_t)e->raw.blocks[b].comp_size) {
-                free(blk); close(tfd); unlink(tmp); return -1;
+            CfsBlock *bl = &e->raw.blocks[b];
+            if (!copyable) { new_off[k++] = bl->offset; continue; }
+            /* A flash extent is one contiguous raw range: align its start to
+             * the format's 4 KiB boundary and copy orig_size bytes verbatim.
+             * Its comp_size is 0 (the raw marker), so the generic path below
+             * would skip it and lose the whole medium. */
+            if (e->raw.mode == CFS_MODE_FLASH) {
+                uint64_t falign = cfs_flash_align();
+                cur_off = (cur_off + falign - 1) & ~(falign - 1);
+                uint64_t span = bl->orig_size, done = 0;
+                uint8_t *bounce = malloc(1024 * 1024);
+                if (!bounce) { free(new_off); close(tfd); unlink(tmp); return -1; }
+                while (done < span) {
+                    size_t n = span - done < 1024 * 1024 ? (size_t)(span - done)
+                                                         : 1024 * 1024;
+                    if (pread(c->fd, bounce, n, (off_t)(bl->offset + done)) != (ssize_t)n ||
+                        pwrite(tfd, bounce, n, (off_t)(cur_off + done)) != (ssize_t)n) {
+                        free(bounce); free(new_off); close(tfd); unlink(tmp); return -1;
+                    }
+                    done += n;
+                }
+                free(bounce);
+                new_off[k++] = cur_off;
+                cur_off += span;
+                continue;
             }
-            if (pwrite(tfd, blk, e->raw.blocks[b].comp_size, (off_t)cur_off) !=
-                (ssize_t)e->raw.blocks[b].comp_size) {
-                free(blk); close(tfd); unlink(tmp); return -1;
+            if (bl->comp_size == 0) { new_off[k++] = bl->offset; continue; }
+            uint8_t *blk = malloc(bl->comp_size);
+            if (!blk) { free(new_off); close(tfd); unlink(tmp); return -1; }
+            if (pread(c->fd, blk, bl->comp_size, (off_t)bl->offset) !=
+                (ssize_t)bl->comp_size) {
+                free(blk); free(new_off); close(tfd); unlink(tmp); return -1;
+            }
+            if (pwrite(tfd, blk, bl->comp_size, (off_t)cur_off) !=
+                (ssize_t)bl->comp_size) {
+                free(blk); free(new_off); close(tfd); unlink(tmp); return -1;
             }
             free(blk);
-            e->raw.blocks[b].offset = cur_off;
-            cur_off += e->raw.blocks[b].comp_size;
+            new_off[k++] = cur_off;
+            cur_off += bl->comp_size;
         }
     }
+    if (k != total_blocks) { free(new_off); close(tfd); unlink(tmp); return -1; }
 
     /* Write inode table */
     size_t ts = 0;
@@ -1378,8 +1541,9 @@ int cfs_compact(CFS *c) {
         ts += CFS_INODE_FIXED_SIZE + (size_t)c->inodes[i].raw.block_count * 16
             + c->inodes[i].raw.path_len;
     uint8_t *tab = calloc(1, ts ? ts : 1);
-    if (!tab) { close(tfd); unlink(tmp); return -1; }
+    if (!tab) { free(new_off); close(tfd); unlink(tmp); return -1; }
     uint8_t *op = tab;
+    size_t j = 0;
     for (uint32_t i = 0; i < c->inode_count; i++) {
         InodeEntry *e = &c->inodes[i];
         wr64(op, e->raw.orig_size); op += 8;
@@ -1388,7 +1552,7 @@ int cfs_compact(CFS *c) {
         wr16(op, e->raw.path_len);  op += 2;
         wr32(op, e->raw.block_count); op += 4;
         for (uint32_t b = 0; b < e->raw.block_count; b++) {
-            wr64(op, e->raw.blocks[b].offset);     op += 8;
+            wr64(op, new_off[j++]);  op += 8;
             wr32(op, e->raw.blocks[b].comp_size);  op += 4;
             wr32(op, e->raw.blocks[b].orig_size);  op += 4;
         }
@@ -1397,7 +1561,7 @@ int cfs_compact(CFS *c) {
     }
     off_t inode_off = (off_t)cur_off;
     if (pwrite(tfd, tab, ts, inode_off) != (ssize_t)ts) {
-        free(tab); close(tfd); unlink(tmp); return -1;
+        free(tab); free(new_off); close(tfd); unlink(tmp); return -1;
     }
     free(tab);
 
@@ -1420,18 +1584,18 @@ int cfs_compact(CFS *c) {
             cfs_sb_encode(rec, &nsb, (uint32_t)slot + 1);
             if (pwrite(tfd, rec, sizeof rec,
                        (off_t)slot * CFS_SB_SLOT_SIZE) != (ssize_t)sizeof rec) {
-                close(tfd); unlink(tmp); return -1;
+                free(new_off); close(tfd); unlink(tmp); return -1;
             }
         }
     }
-    if (fsync(tfd) != 0) { close(tfd); unlink(tmp); return -1; }
+    if (fsync(tfd) != 0) { free(new_off); close(tfd); unlink(tmp); return -1; }
 
     /* Atomic replace: rename temp over original */
     /* Get original path from /proc/self/fd since we only have fd */
     char proc_path[64], orig_path[1024];
     snprintf(proc_path, sizeof(proc_path), "/proc/self/fd/%d", c->fd);
     ssize_t rl = readlink(proc_path, orig_path, sizeof(orig_path) - 1);
-    if (rl < 0) { close(tfd); unlink(tmp); return -1; }
+    if (rl < 0) { free(new_off); close(tfd); unlink(tmp); return -1; }
     orig_path[rl] = 0;
 
     /* Close old fd before rename */
@@ -1439,16 +1603,36 @@ int cfs_compact(CFS *c) {
     close(tfd);
 
     if (rename(tmp, orig_path) != 0) {
-        /* Try to reopen old file */
+        /* Try to reopen old file; the lock was on the old inode and is still
+         * held by the closed fd's open file description only until close, so
+         * take it again on the reopened one. */
         c->fd = open(orig_path, O_RDWR);
+        if (c->fd >= 0 && c->locked) {
+            c->locked = 0;
+            cfs_lock(c);          /* best effort: the caller gets -1 anyway */
+        }
+        unlink(tmp);
+        free(new_off);
         return -1;
     }
 
     /* Reopen the compacted file */
     c->fd = open(orig_path, O_RDWR);
-    if (c->fd < 0) return -1;
+    if (c->fd < 0) { free(new_off); return -1; }
 
-    /* Update superblock in memory */
+    /* The rename made the rebuilt file live; publish its block offsets now. */
+    {
+        size_t a = 0;
+        for (uint32_t i = 0; i < c->inode_count; i++)
+            for (uint32_t b = 0; b < c->inodes[i].raw.block_count; b++)
+                c->inodes[i].raw.blocks[b].offset = new_off[a++];
+    }
+    free(new_off);
+
+    /* The disk is already the compacted file at this point, so update the
+     * in-memory layout BEFORE trying to re-lock: if the lock is lost to a
+     * racing writer, the handle must still describe the file it now has,
+     * not a pre-compact layout with post-compact bytes. */
     memcpy(c->sb.magic, CFS_MAGIC, 8);
     c->sb.version      = CFS_VERSION;
     c->sb.inode_offset = (uint64_t)inode_off;
@@ -1467,6 +1651,15 @@ int cfs_compact(CFS *c) {
     c->append_off = (uint64_t)inode_off + ts;
     if (c->append_off < CFS_SB_REGION) c->append_off = CFS_SB_REGION;
     c->legacy = 0;
+
+    /* rename() replaced the inode the flock was taken on, so the old lock now
+     * protects an unlinked file.  Take it again on the new one.  The handle
+     * is consistent either way (the state above describes the file on disk);
+     * losing the race is reported so the caller does not assume exclusivity. */
+    if (c->locked) {
+        c->locked = 0;
+        if (cfs_lock(c) != 0) return -1;
+    }
     return 0;
 }
 

@@ -69,6 +69,7 @@ typedef struct {
 #define CFS_SB_FLAG_REMOVABLE  0x0002  /* media behaves like USB/SD */
 #define CFS_SB_FLAG_ROTATIONAL 0x0004  /* spinning disk (0 = SSD/flash) */
 #define CFS_SB_FLAG_SD         0x0008  /* removable media is an SD card */
+#define CFS_SB_FLAG_FLASH      0x0010  /* container holds a @flash.* medium */
 
 /* ── Slot record encode/decode (shared by cfs.c and cfs_verify.c) ──
  * A slot is only trusted when its CRC matches; the CRC is what turns a torn
@@ -164,6 +165,68 @@ static inline int cfs_sb_decode(const uint8_t *rec, size_t n, CfsSbSlot *out) {
 #define CFS_MODE_DIR    1
 #define CFS_MODE_SYMLINK 2
 #define CFS_MODE_DEDUP  3   /* blocks[] hold a reference table, not content */
+#define CFS_MODE_FLASH  4   /* a raw flash medium; see CfsFlashDesc below */
+
+/* ── Flash media ────────────────────────────────────────────────
+ * A flash entry is named "@flash.<tag>" and holds one contiguous, 4 KiB
+ * aligned, uncompressed byte range of the container file:
+ *
+ *     [ medium: desc->size bytes ][ descriptor: 4096 bytes ]
+ *
+ * Byte 0 of the medium sits at the start of the range, so it is page aligned
+ * and a consumer can mmap() it straight out of the container file (XIP).  The
+ * descriptor follows the medium and is not part of the address space the
+ * guest sees.
+ *
+ * The block table has one entry per extent:
+ *     { offset = range start, comp_size = 0 (raw marker), orig_size = span }
+ * comp_size == 0 is the "not a CPEnc stream" marker; every other mode must
+ * have a real compressed block there.  A medium is always one entry: the
+ * span must fit orig_size (u32) and CFS_FLASH_MAX keeps media at 1 GiB.
+ *
+ * Unlike every other entry, a flash medium is not compressed, not deduped
+ * and not rewritten by cfs_sync: guest writes go straight to the range with
+ * pwrite().  A medium created with CFS_FLASH_F_XIP promises that the range
+ * never moves, so cfs_compact() refuses the whole container (an XIP consumer
+ * may hold a mapping, and the extent's file offset is part of the contract).
+ * Without that flag the range may move on compact; it is copied verbatim.
+ */
+/* On-disk descriptor: two independent 2 KiB copies inside the 4 KiB area, in
+ * the same spirit as the two superblock slots.  An erase or a bad-block edit
+ * writes the older copy with sequence+1; a torn 2 KiB write leaves the other
+ * copy valid, so the geometry cannot be lost.  Fields are little endian and
+ * fixed-offset; each copy carries a CRC32 over its own first 2044 bytes. */
+#define CFS_FLASH_COPY_SIZE    2048u
+#define CFS_FLASH_DESC_SIZE    4096u
+#define CFS_FLASH_PREFIX       "@flash."
+#define CFS_FLASH_MAGIC        "CFSF"
+#define CFS_FLASH_VERSION      1
+#define CFS_FLASH_MAX          (1ULL << 30)   /* one block entry, honest limit */
+#define CFS_FLASH_F_XIP        0x0001u  /* keep the extent's offset stable */
+#define CFS_FLASH_F_MANAGED    0x0002u  /* FTL behind it: plain sector writes */
+#define CFS_FLASH_F_BADTAB     0x0004u  /* bad-block list is present */
+
+enum { CFS_FLASH_NOR = 0, CFS_FLASH_NAND = 1, CFS_FLASH_EMMC = 2, CFS_FLASH_MCU = 3 };
+
+#define CFS_FLASH_D_MAGIC      0
+#define CFS_FLASH_D_VERSION    4
+#define CFS_FLASH_D_MEDIA      6
+#define CFS_FLASH_D_FLAGS      8
+#define CFS_FLASH_D_SIZE       12
+#define CFS_FLASH_D_SECTOR     20
+#define CFS_FLASH_D_PAGE       24
+#define CFS_FLASH_D_ERASE      28
+#define CFS_FLASH_D_WGRAN      32
+#define CFS_FLASH_D_ERASED     36
+#define CFS_FLASH_D_ECOUNT     40
+#define CFS_FLASH_D_BADN       48
+#define CFS_FLASH_D_BADOFF     52       /* byte offset of the bad-block list */
+#define CFS_FLASH_D_BAD_ENTRY  56       /* u32 erase-block indices */
+#define CFS_FLASH_D_BAD_MAX    ((CFS_FLASH_D_SEQ - CFS_FLASH_D_BAD_ENTRY) / 4)
+#define CFS_FLASH_D_SEQ        2040
+#define CFS_FLASH_D_CRC        2044
+
+
 
 /* ── Merge layer (content-addressed dedup) ───────────────────
  * @store: reserved entry holding the append-only stream of unique bytes.
@@ -207,9 +270,15 @@ static inline int cfs_sb_decode(const uint8_t *rec, size_t n, CfsSbSlot *out) {
 
 typedef struct {
     uint64_t offset;     /* absolute offset in .cfs */
-    uint32_t comp_size;  /* compressed size */
+    uint32_t comp_size;  /* compressed size (0 = raw flash extent) */
     uint32_t orig_size;  /* decompressed size of THIS block */
 } CfsBlock;
+
+/* How many bytes a block table entry occupies in the file: the compressed
+ * payload normally, the whole raw span for a flash range. */
+static inline uint64_t cfs_block_span(uint16_t mode, const CfsBlock *b) {
+    return mode == CFS_MODE_FLASH ? (uint64_t)b->orig_size : (uint64_t)b->comp_size;
+}
 
 typedef struct {
     uint64_t orig_size;      /* uncompressed byte size */

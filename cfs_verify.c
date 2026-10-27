@@ -30,10 +30,11 @@
 /* ── Reporting categories ───────────────────────────────────────
  * One counter pair each, so the summary says *which* layer is unhappy
  * without the reader having to scan the problem list. */
-enum { C_SB, C_TAB, C_BLK, C_HDR, C_DEEP, C_REF, C_STORE, C_PHYS, C_API, C_NCAT };
+enum { C_SB, C_TAB, C_BLK, C_HDR, C_DEEP, C_REF, C_STORE, C_PHYS, C_API,
+       C_FLASH, C_NCAT };
 static const char *const vcat[C_NCAT] = {
     "superblock", "inode-table", "block-table", "block-header", "decompress",
-    "dedup-refs", "@store", "footprint", "api-crosscheck"
+    "dedup-refs", "@store", "footprint", "api-crosscheck", "flash"
 };
 
 #define VPRINT_MAX 20           /* individual problems listed, not just counted */
@@ -52,6 +53,13 @@ typedef struct {
 typedef struct { uint64_t s, e; uint32_t ino, blk; } VRange;   /* physical extent */
 typedef struct { uint64_t s, e; }                    VSpan;    /* @store range */
 typedef struct { const char *p; uint32_t i; }        VName;    /* path, for the dup scan */
+typedef struct {                                              /* one @flash.* medium */
+    const char *name;           /* owned by the inode table, outlives the summary */
+    int         valid;          /* a copy the reader would accept was found */
+    uint64_t    size;           /* guest-visible bytes */
+    uint64_t    erase_count;
+    uint32_t    sector, page, erase, bad_n, media, flags;
+} VFlash;
 
 typedef struct {
     FILE       *out;
@@ -85,6 +93,9 @@ typedef struct {
     /* api cross-check */
     int         api_open, api_mismatch;
     uint32_t    user_count;           /* entries cfs.c would count as files */
+
+    /* flash media */
+    VFlash     *fl;  uint32_t nfl, cfl;
 
     VRange     *rng;  uint32_t nrng, crng;
     VSpan      *spn;  uint32_t nspn, cspn;
@@ -134,6 +145,16 @@ static int vpush_span(VCtx *v, uint64_t s, uint64_t e) {
         v->spn = nv; v->cspn = nc;
     }
     v->spn[v->nspn++] = (VSpan){ s, e };
+    return 0;
+}
+static int vpush_flash(VCtx *v, VFlash f) {
+    if (v->nfl == v->cfl) {
+        uint32_t nc = v->cfl ? v->cfl * 2 : 8;
+        VFlash *nv = realloc(v->fl, (size_t)nc * sizeof *nv);
+        if (!nv) return -1;
+        v->fl = nv; v->cfl = nc;
+    }
+    v->fl[v->nfl++] = f;
     return 0;
 }
 static int cmp_range(const void *a, const void *b) {
@@ -323,8 +344,291 @@ static VInode *parse_table(VCtx *v, const uint8_t *t, uint64_t tlen,
     return ins;
 }
 
+/* ── flash media ────────────────────────────────────────────────
+ * A @flash.<tag> entry is one raw extent [medium][4096-byte descriptor]
+ * described by a single block entry { offset, comp_size = 0, orig_size = span }.
+ * The descriptor holds two independent 2 KiB copies; the reader takes the
+ * highest sequence number among the copies whose magic, version, CRC,
+ * geometry and bad-block list it accepts.  Everything below restates those
+ * rules from the bytes alone — cfs_flash.c is deliberately not linked in. */
+
+static int vpow2(uint32_t x) { return x && !(x & (x - 1)); }
+
+static const char *vmedia_name(unsigned m) {
+    switch (m) {
+    case CFS_FLASH_NOR:  return "nor";
+    case CFS_FLASH_NAND: return "nand";
+    case CFS_FLASH_EMMC: return "emmc";
+    case CFS_FLASH_MCU:  return "mcu";
+    default:             return "unknown";
+    }
+}
+
+typedef struct {
+    int      magic_ok, version_ok, crc_ok;
+    uint16_t version, media;
+    uint32_t flags;
+    uint64_t size;
+    uint32_t sector, page, erase, wgran, erased;
+    uint64_t erase_count;
+    uint32_t bad_n, bad_off, seq;
+} VFlashCopy;
+
+static void vflash_parse_copy(const uint8_t *d, VFlashCopy *c) {
+    memset(c, 0, sizeof *c);
+    c->magic_ok   = memcmp(d + CFS_FLASH_D_MAGIC, CFS_FLASH_MAGIC, 4) == 0;
+    c->version    = rd16(d + CFS_FLASH_D_VERSION);
+    c->version_ok = c->version == CFS_FLASH_VERSION;
+    c->crc_ok     = rd32(d + CFS_FLASH_D_CRC) == cfs_sb_crc32(d, CFS_FLASH_D_CRC);
+    c->media       = rd16(d + CFS_FLASH_D_MEDIA);
+    c->flags       = rd32(d + CFS_FLASH_D_FLAGS);
+    c->size        = rd64(d + CFS_FLASH_D_SIZE);
+    c->sector      = rd32(d + CFS_FLASH_D_SECTOR);
+    c->page        = rd32(d + CFS_FLASH_D_PAGE);
+    c->erase       = rd32(d + CFS_FLASH_D_ERASE);
+    c->wgran       = rd32(d + CFS_FLASH_D_WGRAN);
+    c->erased      = rd32(d + CFS_FLASH_D_ERASED);
+    c->erase_count = rd64(d + CFS_FLASH_D_ECOUNT);
+    c->bad_n       = rd32(d + CFS_FLASH_D_BADN);
+    c->bad_off     = rd32(d + CFS_FLASH_D_BADOFF);
+    c->seq         = rd32(d + CFS_FLASH_D_SEQ);
+}
+
+/* The same geometry rules cfs_flash.c applies when it reads a descriptor.  A
+ * copy that fails any of them is not one the reader would use. */
+static int vflash_geom(VCtx *v, uint32_t idx, const char *nm, int ci,
+                       const VFlashCopy *c, uint64_t span) {
+    int ok = 1;
+#define VFGEOM(cond, ...) \
+    do { if (!(cond)) { vprob(v, C_FLASH, 1, __VA_ARGS__); ok = 0; } } while (0)
+    VFGEOM(c->size != 0,
+           "entry %u \"%s\": descriptor copy %d: medium size is 0", idx, nm, ci);
+    VFGEOM(c->size <= CFS_FLASH_MAX,
+           "entry %u \"%s\": descriptor copy %d: medium size %llu exceeds CFS_FLASH_MAX (%llu)",
+           idx, nm, ci, (unsigned long long)c->size, (unsigned long long)CFS_FLASH_MAX);
+    /* Both fields are untrusted: subtract rather than add. */
+    VFGEOM(c->size <= span && span - c->size == CFS_FLASH_DESC_SIZE,
+           "entry %u \"%s\": descriptor copy %d: size=%llu plus the %u-byte descriptor "
+           "does not equal the block span %llu",
+           idx, nm, ci, (unsigned long long)c->size, (unsigned)CFS_FLASH_DESC_SIZE,
+           (unsigned long long)span);
+    VFGEOM(vpow2(c->sector),
+           "entry %u \"%s\": descriptor copy %d: sector=%u is not a power of two",
+           idx, nm, ci, (unsigned)c->sector);
+    VFGEOM(vpow2(c->page),
+           "entry %u \"%s\": descriptor copy %d: page=%u is not a power of two",
+           idx, nm, ci, (unsigned)c->page);
+    VFGEOM(vpow2(c->erase),
+           "entry %u \"%s\": descriptor copy %d: erase=%u is not a power of two",
+           idx, nm, ci, (unsigned)c->erase);
+    /* No page-vs-sector ordering: NOR reads in 512-byte sectors but programs
+     * in 256-byte pages.  What must hold is that the erase block contains
+     * both. */
+    VFGEOM(c->erase >= c->sector,
+           "entry %u \"%s\": descriptor copy %d: erase=%u is smaller than sector=%u",
+           idx, nm, ci, (unsigned)c->erase, (unsigned)c->sector);
+    VFGEOM(c->erase >= c->page,
+           "entry %u \"%s\": descriptor copy %d: erase=%u is smaller than page=%u",
+           idx, nm, ci, (unsigned)c->erase, (unsigned)c->page);
+    /* Guard the divisions: a zero divisor is reported by the pow2 checks. */
+    VFGEOM(!c->page || c->erase % c->page == 0,
+           "entry %u \"%s\": descriptor copy %d: erase=%u is not a multiple of page=%u",
+           idx, nm, ci, (unsigned)c->erase, (unsigned)c->page);
+    VFGEOM(!c->erase || c->size % c->erase == 0,
+           "entry %u \"%s\": descriptor copy %d: size=%llu is not a multiple of erase=%u",
+           idx, nm, ci, (unsigned long long)c->size, (unsigned)c->erase);
+    /* The reader treats write_gran as the program page on raw media and as
+     * the sector on managed ones, so a copy where it disagrees would make
+     * every consumer's page arithmetic wrong. */
+    VFGEOM(c->wgran == ((c->flags & CFS_FLASH_F_MANAGED) ? c->sector : c->page),
+           "entry %u \"%s\": descriptor copy %d: write_gran=%u is neither the page (%u) nor the sector (%u) its flags imply",
+           idx, nm, ci, (unsigned)c->wgran, (unsigned)c->page, (unsigned)c->sector);
+    VFGEOM(c->erased == 0xFF,
+           "entry %u \"%s\": descriptor copy %d: erased byte is 0x%02x (v1 supports 0xff only)",
+           idx, nm, ci, (unsigned)c->erased);
+    VFGEOM(c->media <= CFS_FLASH_MCU,
+           "entry %u \"%s\": descriptor copy %d: media=%u is not NOR/NAND/EMMC/MCU",
+           idx, nm, ci, (unsigned)c->media);
+#undef VFGEOM
+    return ok;
+}
+
+/* Bad-block entries are erase-block indices; the reader rejects the copy when
+ * the count overflows the list or an index lies outside the medium. */
+static int vflash_badlist(VCtx *v, uint32_t idx, const char *nm, int ci,
+                          const uint8_t *d, const VFlashCopy *c) {
+    if (c->bad_off != CFS_FLASH_D_BAD_ENTRY) {
+        vprob(v, C_FLASH, 1,
+              "entry %u \"%s\": descriptor copy %d: bad-block list offset %u is not the fixed %u",
+              idx, nm, ci, (unsigned)c->bad_off, (unsigned)CFS_FLASH_D_BAD_ENTRY);
+        return 0;
+    }
+    if (c->bad_n > CFS_FLASH_D_BAD_MAX) {
+        vprob(v, C_FLASH, 1,
+              "entry %u \"%s\": descriptor copy %d: bad-block count %u exceeds the list capacity %u",
+              idx, nm, ci, (unsigned)c->bad_n, (unsigned)CFS_FLASH_D_BAD_MAX);
+        return 0;
+    }
+    if (!c->erase || !c->size) return 1;   /* geometry already reported */
+    int ok = 1;
+    for (uint32_t i = 0; i < c->bad_n; i++) {
+        uint32_t bad = rd32(d + CFS_FLASH_D_BAD_ENTRY + (size_t)i * 4);
+        if ((uint64_t)bad * c->erase >= c->size) {
+            vprob(v, C_FLASH, 1,
+                  "entry %u \"%s\": descriptor copy %d: bad-block entry %u names erase block %u, "
+                  "outside [0,%llu)",
+                  idx, nm, ci, i, (unsigned)bad,
+                  (unsigned long long)(c->size / c->erase));
+            ok = 0;
+        }
+    }
+    return ok;
+}
+
+/* A flash inode's block table, extent bounds, overlap accounting and its
+ * descriptor.  Called from check_blocks() instead of the CPEnc-shaped path:
+ * flash bytes are raw, so there is no header, no decode and no
+ * sum(orig_size)==inode.orig_size prefix-sum rule. */
+static void check_flash(VCtx *v, const VInode *in, uint32_t idx) {
+    const char *nm = in->path ? in->path : "(no path)";
+    VFlash fs;
+    memset(&fs, 0, sizeof fs);
+    fs.name = nm;
+
+    if (in->nblk != 1)
+        vprob(v, C_FLASH, 1, "entry %u \"%s\": flash medium with block_count=%u "
+              "(the format uses exactly one entry)", idx, nm, (unsigned)in->nblk);
+
+    int span_ok = 0;
+    for (uint32_t b = 0; b < in->nblk; b++) {
+        const VBlk *bl = &in->blk[b];
+        v->nblk++;
+        v->comp_bytes += bl->comp;
+        v->orig_bytes += bl->orig;
+        if (bl->comp != 0)
+            vprob(v, C_FLASH, 1, "entry %u \"%s\" block %u: comp_size=%u on a raw flash "
+                  "extent (must be 0)", idx, nm, b, (unsigned)bl->comp);
+        if (in->orig != bl->orig)
+            vprob(v, C_FLASH, 1, "entry %u \"%s\" block %u: inode orig_size=%llu, "
+                  "block orig_size=%u", idx, nm, b,
+                  (unsigned long long)in->orig, (unsigned)bl->orig);
+        if (bl->orig < CFS_FLASH_DESC_SIZE) {
+            vprob(v, C_FLASH, 1, "entry %u \"%s\" block %u: span %u B is smaller than "
+                  "the %u-byte descriptor", idx, nm, b, (unsigned)bl->orig,
+                  (unsigned)CFS_FLASH_DESC_SIZE);
+            continue;
+        }
+        if (bl->off < CFS_SB_REGION) {
+            v->oob++;
+            vprob(v, C_FLASH, 1, "entry %u \"%s\" block %u: offset=%llu overlaps the superblock slot region (0..%u)",
+                  idx, nm, b, (unsigned long long)bl->off, (unsigned)CFS_SB_REGION);
+        }
+        if (bl->off > v->fsz || bl->orig > v->fsz - bl->off) {
+            v->oob++;
+            vprob(v, C_FLASH, 1, "entry %u \"%s\" block %u: [%llu,%llu) lies past the end "
+                  "of the file (%llu B)", idx, nm, b, (unsigned long long)bl->off,
+                  (unsigned long long)(bl->off + bl->orig), (unsigned long long)v->fsz);
+            continue;   /* don't feed an extent we cannot trust into the overlap map */
+        }
+        if ((bl->off % CFS_FLASH_DESC_SIZE) != 0)
+            vprob(v, C_FLASH, 1, "entry %u \"%s\" block %u: offset=%llu is not %u-byte aligned",
+                  idx, nm, b, (unsigned long long)bl->off, (unsigned)CFS_FLASH_DESC_SIZE);
+        if (bl->off + bl->orig > v->high_water) v->high_water = bl->off + bl->orig;
+        /* A medium is content, not metadata: its whole span goes into the
+         * overlap map so it is checked against every block and the table. */
+        if (vpush_range(v, bl->off, bl->off + bl->orig, idx, b) != 0) {
+            vpush_flash(v, fs);
+            return;
+        }
+        if (b == 0) span_ok = 1;
+    }
+
+    /* The descriptor exists only in the single-entry form. */
+    const VBlk *bl = in->nblk ? &in->blk[0] : NULL;
+    if (!bl || in->nblk != 1 || !span_ok) {
+        vpush_flash(v, fs);
+        return;
+    }
+
+    uint64_t desc_off = bl->off + bl->orig - CFS_FLASH_DESC_SIZE;
+    uint8_t area[CFS_FLASH_DESC_SIZE];
+    if (vpread(v, area, sizeof area, desc_off) != 0) {
+        vprob(v, C_FLASH, 1, "entry %u \"%s\": cannot read the descriptor at %llu",
+              idx, nm, (unsigned long long)desc_off);
+        vpush_flash(v, fs);
+        return;
+    }
+
+    VFlashCopy cp[2];
+    vflash_parse_copy(area, &cp[0]);
+    vflash_parse_copy(area + CFS_FLASH_COPY_SIZE, &cp[1]);
+    int hdr[2];
+    for (int i = 0; i < 2; i++)
+        hdr[i] = cp[i].magic_ok && cp[i].version_ok && cp[i].crc_ok;
+
+    /* One unusable copy is exactly what the two-copy scheme is designed to
+     * survive (a torn 2 KiB update), so it warns while the other copy's
+     * header is intact; when neither is intact the geometry is gone. */
+    for (int i = 0; i < 2; i++) {
+        if (hdr[i]) continue;
+        int sev = hdr[i ^ 1] ? 0 : 1;
+        if (!cp[i].magic_ok)
+            vprob(v, C_FLASH, sev, "entry %u \"%s\": descriptor copy %d: magic is not \""
+                  CFS_FLASH_MAGIC "\"", idx, nm, i);
+        if (!cp[i].version_ok)
+            vprob(v, C_FLASH, sev, "entry %u \"%s\": descriptor copy %d: version %u "
+                  "(this build reads %u)", idx, nm, i,
+                  (unsigned)cp[i].version, (unsigned)CFS_FLASH_VERSION);
+        if (!cp[i].crc_ok)
+            vprob(v, C_FLASH, sev, "entry %u \"%s\": descriptor copy %d: CRC does not "
+                  "match its fields%s", idx, nm, i,
+                  sev ? "" : " (torn update; the other copy is used)");
+    }
+    if (!hdr[0] && !hdr[1])
+        vprob(v, C_FLASH, 1, "entry %u \"%s\": neither descriptor copy is usable "
+              "(lost magic, version or CRC)", idx, nm);
+
+    /* Validity as the reader sees it: header, geometry and the bad-block list
+     * it would load.  Both copies are checked, because either may become the
+     * one the reader falls back to. */
+    int ok[2] = { 0, 0 };
+    for (int i = 0; i < 2; i++) {
+        if (!hdr[i]) continue;
+        int g = vflash_geom(v, idx, nm, i, &cp[i], bl->orig);
+        int b = vflash_badlist(v, idx, nm, i,
+                               area + (size_t)i * CFS_FLASH_COPY_SIZE, &cp[i]);
+        ok[i] = g && b;
+    }
+    int pick = -1;
+    if (ok[0] && (!ok[1] || cp[0].seq >= cp[1].seq)) pick = 0;
+    else if (ok[1]) pick = 1;
+    if (pick < 0 && (hdr[0] || hdr[1]))
+        vprob(v, C_FLASH, 1, "entry %u \"%s\": no descriptor copy passes the reader's "
+              "checks", idx, nm);
+
+    if (pick >= 0) {
+        const VFlashCopy *c = &cp[pick];
+        fs.valid       = 1;
+        fs.size        = c->size;
+        fs.sector      = c->sector;
+        fs.page        = c->page;
+        fs.erase       = c->erase;
+        fs.erase_count = c->erase_count;
+        fs.bad_n       = c->bad_n;
+        fs.media       = c->media;
+        fs.flags       = c->flags;
+        unsigned unknown = c->flags & ~(CFS_FLASH_F_XIP | CFS_FLASH_F_MANAGED |
+                                        CFS_FLASH_F_BADTAB);
+        if (unknown)
+            vprob(v, C_FLASH, 0, "entry %u \"%s\": descriptor flags 0x%04x have unknown "
+                  "bits 0x%04x", idx, nm, c->flags, unknown);
+    }
+    vpush_flash(v, fs);
+}
+
 /* ── block table checks ─────────────────────────────────────── */
 static void check_blocks(VCtx *v, const VInode *in, uint32_t idx) {
+    if (in->mode == CFS_MODE_FLASH) { check_flash(v, in, idx); return; }
     const char *nm = in->path ? in->path : "(no path)";
     uint64_t sum = 0;
     uint64_t prev_off = 0;
@@ -434,6 +738,7 @@ static void check_blocks(VCtx *v, const VInode *in, uint32_t idx) {
  * write landed.  Cheap enough to do without --deep. */
 static void check_block_header(VCtx *v, const VInode *in, uint32_t idx) {
     const char *nm = in->path ? in->path : "(no path)";
+    if (in->mode == CFS_MODE_FLASH) return;   /* raw extent: no CPEnc header */
     for (uint32_t b = 0; b < in->nblk; b++) {
         const VBlk *bl = &in->blk[b];
         if (bl->comp < CPENC_HEADER_SIZE || bl->off < CFS_SB_SIZE) continue;
@@ -544,6 +849,7 @@ static void deep_crosscheck(VCtx *v, CFS *c, const VInode *in,
                             const CfsDedupTable *t, const VInode *store) {
     const char *nm = in->path;
     const size_t CH = 1u << 20;
+    if (in->mode == CFS_MODE_FLASH) return;   /* cfs_read() refuses a medium */
     /* @block is a device, not a file: the library's view of it is
      * cfs_block_read(), which zero-fills the unwritten tail.  Plain cfs_read()
      * returns 0 there (the inode has no content blocks), which is why an
@@ -663,6 +969,18 @@ static void print_summary(VCtx *v, const VSb *sb, int have_sb, int deep) {
                 (unsigned long long)(v->device_size > v->device_used ? v->device_size - v->device_used : 0));
     else
         fprintf(o, "  device        no @block entry\n");
+    for (uint32_t i = 0; i < v->nfl; i++) {
+        const VFlash *f = &v->fl[i];
+        if (!f->valid)
+            fprintf(o, "  @flash        \"%s\": descriptor unusable\n", f->name);
+        else
+            fprintf(o, "  @flash        \"%s\" %llu B, media=%s, sector=%u page=%u erase=%u, "
+                       "erase_count=%llu, bad=%u, flags=0x%04x%s\n",
+                    f->name, (unsigned long long)f->size, vmedia_name(f->media),
+                    f->sector, f->page, f->erase,
+                    (unsigned long long)f->erase_count, f->bad_n, f->flags,
+                    (f->flags & CFS_FLASH_F_XIP) ? " (xip)" : "");
+    }
     if (deep)
         fprintf(o, "  deep          %llu block(s), %llu B decoded; read path cross-checked\n",
                 (unsigned long long)v->deep_blocks, (unsigned long long)v->deep_bytes);
@@ -791,7 +1109,8 @@ int cfs_verify(const char *path, unsigned flags, FILE *out) {
                       (unsigned)sb.version, (unsigned)CFS_VERSION_LEGACY,
                       (unsigned)CFS_VERSION);
             if (sb.flags & ~(CFS_SB_FLAG_RAW | CFS_SB_FLAG_REMOVABLE |
-                             CFS_SB_FLAG_ROTATIONAL | CFS_SB_FLAG_SD))
+                             CFS_SB_FLAG_ROTATIONAL | CFS_SB_FLAG_SD |
+                             CFS_SB_FLAG_FLASH))
                 vprob(&v, C_SB, 0, "unknown flag bits 0x%04x set", (unsigned)(sb.flags & 0xFFF0));
             v.file_count = sb.file_count;
         }
@@ -848,9 +1167,23 @@ int cfs_verify(const char *path, unsigned flags, FILE *out) {
             else if (memchr(e->path, 0, e->plen))
                 vprob(&v, C_TAB, 1, "entry %u: path contains a NUL byte — cfs_open() would look it up as \"%s\"",
                       i, e->path);
-            if (e->mode > CFS_MODE_DEDUP)
-                vprob(&v, C_TAB, 1, "entry %u \"%s\": mode=%u is not FILE/DIR/SYMLINK/DEDUP",
+            if (e->mode > CFS_MODE_FLASH)
+                vprob(&v, C_TAB, 1, "entry %u \"%s\": mode=%u is not FILE/DIR/SYMLINK/DEDUP/FLASH",
                       i, nm, (unsigned)e->mode);
+            /* cfs_flash_open() resolves a tag to "@flash.<tag>", then looks
+             * that name up; a medium under any other name cannot be opened,
+             * read or written through the API. */
+            if (e->mode == CFS_MODE_FLASH &&
+                (!e->path || strncmp(e->path, CFS_FLASH_PREFIX,
+                                     strlen(CFS_FLASH_PREFIX)) != 0))
+                vprob(&v, C_FLASH, 1, "entry %u \"%s\": mode=FLASH but the name lacks the "
+                      "\"%s\" prefix (unreachable through cfs_flash_open)", i, nm,
+                      CFS_FLASH_PREFIX);
+            /* cfs_flash_open() builds the name in a 300-byte buffer; a longer
+             * one has a legal mode and descriptor but can never be opened. */
+            if (e->mode == CFS_MODE_FLASH && e->plen + 1 > 300)
+                vprob(&v, C_FLASH, 1, "entry %u: flash name is %u bytes; "
+                      "cfs_flash_open() can address at most 299", i, (unsigned)e->plen);
             if (!(e->path && e->path[0] == '@')) v.user_count++;
             if (e->path && !strcmp(e->path, CFS_STORE_PATH)) {
                 if (v.have_store)
@@ -963,6 +1296,7 @@ int cfs_verify(const char *path, unsigned flags, FILE *out) {
             const VInode *e = &ins[i];
             if (e->mode == CFS_MODE_DIR || e->nblk == 0) continue;
             if (e->mode == CFS_MODE_DEDUP) continue;   /* table blocks already decoded */
+            if (e->mode == CFS_MODE_FLASH) continue;   /* raw extent, not a CPEnc stream */
             for (uint32_t b = 0; b < e->nblk; b++) {
                 if (e->blk[b].orig > CFS_BLOCK_MAX) continue;   /* reported above */
                 uint8_t *dec = malloc(e->blk[b].orig ? e->blk[b].orig : 1);
@@ -1049,7 +1383,7 @@ int cfs_verify(const char *path, unsigned flags, FILE *out) {
         for (uint32_t i = 0; i < n; i++) { free(ins[i].path); free(ins[i].blk); }
         free(ins);
     }
-    free(v.rng); free(v.spn);
+    free(v.rng); free(v.spn); free(v.fl);
     close(v.fd);
     return (int)(v.err > 0x7FFFFFFF ? 0x7FFFFFFF : v.err);
 }
